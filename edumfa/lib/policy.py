@@ -135,6 +135,7 @@ from edumfa.lib.utils.export import register_export, register_import
 
 from ..models import Policy, Token, db, save_config_timestamp
 from .log import log_with
+from .tracing import trace_span
 
 log = logging.getLogger(__name__)
 
@@ -1256,13 +1257,18 @@ class PolicyClass:
         from edumfa.lib.token import get_dynamic_policy_definitions
 
         role = logged_in_user.get("role")
-        user_rights = self.ui_get_rights(
-            role, logged_in_user.get("realm"), logged_in_user.get("username"), client
-        )
+        with trace_span("policy.ui_get_main_menus.ui_get_rights"):
+            user_rights = self.ui_get_rights(
+                role,
+                logged_in_user.get("realm"),
+                logged_in_user.get("username"),
+                client,
+            )
         main_menus = []
-        static_rights = get_static_policy_definitions(role)
-        enroll_rights = get_dynamic_policy_definitions(role)
-        static_rights.update(enroll_rights)
+        with trace_span("policy.ui_get_main_menus.get_policy_definitions"):
+            static_rights = get_static_policy_definitions(role)
+            enroll_rights = get_dynamic_policy_definitions(role)
+            static_rights.update(enroll_rights)
         for r in user_rights:
             menus = static_rights.get(r, {}).get("mainmenu", [])
             main_menus.extend(menus)
@@ -1307,15 +1313,17 @@ class PolicyClass:
             extended_condition_check = CONDITION_CHECK.ONLY_CHECK_USERINFO
         else:
             raise PolicyError(f"Unknown scope: {scope}")
-        pols = self.match_policies(
-            scope=scope,
-            user_object=user_object,
-            adminrealm=admin_realm,
-            adminuser=admin_user,
-            active=True,
-            client=client,
-            extended_condition_check=extended_condition_check,
-        )
+        with trace_span("policy.ui_get_rights.match_policies") as span:
+            span.set_attribute("edumfa.scope", scope)
+            pols = self.match_policies(
+                scope=scope,
+                user_object=user_object,
+                adminrealm=admin_realm,
+                adminuser=admin_user,
+                active=True,
+                client=client,
+                extended_condition_check=extended_condition_check,
+            )
         for pol in pols:
             for action, action_value in pol.get("action").items():
                 if action_value:
@@ -1324,13 +1332,14 @@ class PolicyClass:
                     if isinstance(action_value, str):
                         rights.add(f"{action}={action_value}")
         # check if we have policies at all:
-        pols = self.list_policies(scope=scope, active=True)
-        if not pols:
-            # We do not have any policies in this scope, so we return all
-            # possible actions in this scope.
-            log.debug("No policies defined, so we set all rights.")
-            rights = get_static_policy_definitions(scope)
-            rights.update(get_dynamic_policy_definitions(scope))
+        with trace_span("policy.ui_get_rights.list_policies_and_definitions"):
+            pols = self.list_policies(scope=scope, active=True)
+            if not pols:
+                # We do not have any policies in this scope, so we return all
+                # possible actions in this scope.
+                log.debug("No policies defined, so we set all rights.")
+                rights = get_static_policy_definitions(scope)
+                rights.update(get_dynamic_policy_definitions(scope))
         rights = list(rights)
         log.debug(f"returning the admin rights: {rights}")
         return rights

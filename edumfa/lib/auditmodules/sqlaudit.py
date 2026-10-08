@@ -142,14 +142,15 @@ class Audit(AuditBase):
             "EDUMFA_AUDIT_NO_PRIVATE_KEY_CHECK", False
         )
         if self.sign_data:
-            with trace_span("audit.init.read_keys_and_sign_object"):
+            with trace_span("audit.init.read_keys") as span:
                 self.read_keys(
                     self.config.get("EDUMFA_AUDIT_KEY_PUBLIC"),
                     self.config.get("EDUMFA_AUDIT_KEY_PRIVATE"),
                 )
-                self.sign_object = Sign(
-                    self.private, self.public, check_private_key=self.check_private_key
+                span.set_attribute(
+                    "edumfa.check_private_key", bool(self.check_private_key)
                 )
+            self.sign_object = self._get_sign_object()
         # Read column_length from the config file
         config_column_length = self.config.get("EDUMFA_AUDIT_SQL_COLUMN_LENGTH", {})
         # fill the missing parts with the default from the models
@@ -184,6 +185,32 @@ class Audit(AuditBase):
             else:
                 self.session = store["sqlaudit.session"]
         self.session._model_changes = {}
+
+    def _get_sign_object(self):
+        """
+        Return a ``Sign`` object for the configured audit keys.
+
+        Constructing a ``Sign`` object loads and validates the RSA private and
+        public key. Depending on the key size, this validation can take tens of
+        milliseconds and would otherwise be repeated for *every* audit object
+        that is created during a request. Since the audit keys rarely change, we
+        cache the resulting ``Sign`` object in the app-local store and key it by
+        the key material and the validation setting.
+        """
+        cache_key = (self.private, self.public, bool(self.check_private_key))
+        store = get_app_local_store()
+        cache = store.setdefault("sqlaudit.sign_objects", {})
+        sign_object = cache.get(cache_key)
+        if sign_object is None:
+            with trace_span("audit.init.sign_object") as span:
+                span.set_attribute(
+                    "edumfa.check_private_key", bool(self.check_private_key)
+                )
+                sign_object = Sign(
+                    self.private, self.public, check_private_key=self.check_private_key
+                )
+            cache[cache_key] = sign_object
+        return sign_object
 
     def _create_engine(self):
         """
