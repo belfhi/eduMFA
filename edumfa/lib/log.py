@@ -32,20 +32,48 @@ from collections.abc import Callable
 from copy import deepcopy
 from logging import Formatter
 
+from pythonjsonlogger import jsonlogger
 from typing_extensions import ParamSpec, TypeVar
 
 log = logging.getLogger(__name__)
+
+
+def secure_message(message):
+    """
+    Replace non-printable characters in ``message`` with a dot.
+
+    This is used to make sure that log output can not be corrupted by control
+    characters from e.g. user store data. If at least one character has been
+    replaced, a marker is prepended to the message.
+
+    :param message: the (already formatted) log message
+    :type message: str
+    :return: the sanitized log message
+    :rtype: str
+    """
+    secured = False
+
+    s = ""
+    for c in message:
+        if c in string.printable:
+            s += c
+        else:
+            s += "."
+            secured = True
+
+    if secured:
+        s = "!!!Log Entry Secured by SecureFormatter!!! " + s
+
+    return s
 
 
 DEFAULT_LOGGING_CONFIG = {
     "version": 1,
     "formatters": {
         "detail": {
-            "()": "edumfa.lib.log.SecureFormatter",
-            "format": "[%(asctime)s][%(process)d]"
-            "[%(thread)d][%(levelname)s]"
-            "[%(name)s:%(lineno)d] "
-            "%(message)s",
+            "()": "edumfa.lib.log.SecureJsonFormatter",
+            "format": "%(asctime)s %(process)d %(thread)d %(levelname)s "
+            "%(name)s:%(lineno)d %(message)s",
         }
     },
     "handlers": {
@@ -86,20 +114,41 @@ R = TypeVar("R")
 class SecureFormatter(Formatter):
     def format(self, record):
         message = super().format(record)
-        secured = False
+        return secure_message(message)
 
-        s = ""
-        for c in message:
-            if c in string.printable:
-                s += c
-            else:
-                s += "."
-                secured = True
 
-        if secured:
-            s = "!!!Log Entry Secured by SecureFormatter!!! " + s
+class SecureJsonFormatter(jsonlogger.JsonFormatter):
+    """
+    JSON formatter for log records, which sanitizes non-printable characters
+    in the log message before it is serialized.
 
-        return s
+    This mirrors :py:class:`SecureFormatter` but emits one JSON object per log
+    line, which makes the logs machine-readable (e.g. for log collectors).
+    """
+
+    def format(self, record):
+        # Sanitize the message (and any exception text) in place before the
+        # JSON formatter picks it up. We keep the original values so that other
+        # formatters or handlers are not affected.
+        original_msg = record.msg
+        original_args = record.args
+        original_exc_text = record.exc_text
+        original_exc_info = record.exc_info
+        try:
+            if isinstance(record.msg, str):
+                record.msg = secure_message(record.msg)
+            if record.exc_info:
+                # ``Formatter.formatException`` uses ``exc_text``; render and
+                # sanitize it ourselves, then prevent re-rendering.
+                exc_text = self.formatException(record.exc_info)
+                record.exc_text = secure_message(exc_text)
+                record.exc_info = None
+            return super().format(record)
+        finally:
+            record.msg = original_msg
+            record.args = original_args
+            record.exc_text = original_exc_text
+            record.exc_info = original_exc_info
 
 
 class log_with:

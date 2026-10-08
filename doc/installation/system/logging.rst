@@ -128,6 +128,41 @@ The old `python logging config file format <https://docs.python.org/3/library/lo
 
 .. note:: The filename extension is irrelevant in this case
 
+JSON logging
+~~~~~~~~~~~~
+
+For machine-readable logs (e.g. for log collectors such as Loki, logstash or
+Splunk) eduMFA ships the ``SecureJsonFormatter``, which emits one JSON object
+per log line. It is based on `python-json-logger
+<https://github.com/nhairs/python-json-logger>`_ and additionally replaces
+non-printable characters in the message, just like ``SecureFormatter``.
+
+The fields that are included in the JSON output are those listed in the
+``format`` string. A logging configuration using the JSON formatter looks like
+this:
+
+.. code-block:: yaml
+
+    version: 1
+    formatters:
+      json:
+        (): edumfa.lib.log.SecureJsonFormatter
+        format: '%(asctime)s %(process)d %(thread)d %(levelname)s %(name)s %(lineno)d %(message)s'
+
+    handlers:
+      stdhandler:
+        class: logging.StreamHandler
+        formatter: json
+        stream: ext://sys.stdout
+
+    loggers:
+      edumfa:
+        handlers:
+        - stdhandler
+        level: INFO
+
+The container image ships such a configuration as ``/opt/edumfa/logging.yml``.
+
 .. rubric:: Footnotes
 
 .. [#yaml] https://yaml.org/
