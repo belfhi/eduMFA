@@ -1,0 +1,20 @@
+{
+  "name": "Debian",
+  "image": "mcr.microsoft.com/devcontainers/python:3.14-trixie",
+  "features": {
+    "ghcr.io/devcontainers-extra/features/opencode:1": {},
+    "ghcr.io/jsburckhardt/devcontainer-features/uv:1": {}
+  },
+  "remoteEnv": {
+    "OPENCODE_CONFIG": "${containerWorkspaceFolder}/.devcontainer/opencode.json",
+    "DESY_ASSISTANT_API_KEY": "${localEnv:DESY_ASSISTANT_API_KEY}"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "charliermarsh.ruff",
+        "sst-dev.opencode"
+      ]
+    }
+  }
+}
