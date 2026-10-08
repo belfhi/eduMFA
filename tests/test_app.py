@@ -93,11 +93,9 @@ class AppTestCase(unittest.TestCase):
                     "logging.handlers.RotatingFileHandler",
                     baseFilename=os.path.join(dirname, "edumfa.log"),
                     formatter=Comparison(
-                        "edumfa.lib.log.SecureFormatter",
-                        _fmt="[%(asctime)s][%(process)d]"
-                        "[%(thread)d][%(levelname)s]"
-                        "[%(name)s:%(lineno)d] "
-                        "%(message)s",
+                        "edumfa.lib.log.SecureJsonFormatter",
+                        _fmt="%(asctime)s %(process)d %(thread)d %(levelname)s "
+                        "%(name)s:%(lineno)d %(message)s",
                         partial=True,
                     ),
                     level=logging.DEBUG,
@@ -227,11 +225,9 @@ class AppTestCase(unittest.TestCase):
                         "logging.handlers.RotatingFileHandler",
                         baseFilename=os.path.join(dirname, "edumfa.log"),
                         formatter=Comparison(
-                            "edumfa.lib.log.SecureFormatter",
-                            _fmt="[%(asctime)s][%(process)d]"
-                            "[%(thread)d][%(levelname)s]"
-                            "[%(name)s:%(lineno)d] "
-                            "%(message)s",
+                            "edumfa.lib.log.SecureJsonFormatter",
+                            _fmt="%(asctime)s %(process)d %(thread)d %(levelname)s "
+                            "%(name)s:%(lineno)d %(message)s",
                             partial=True,
                         ),
                         level=logging.INFO,

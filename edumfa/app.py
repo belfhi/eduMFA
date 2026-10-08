@@ -94,6 +94,71 @@ def get_locale():
     return get_accepted_language(request)
 
 
+# Map the config value of EDUMFA_LDAP_LOGGING_DETAIL to ldap3's detail levels.
+_LDAP3_DETAIL_LEVELS = {
+    "off": 0,
+    "error": 10,
+    "basic": 20,
+    "protocol": 30,
+    "network": 40,
+    "extended": 50,
+}
+
+
+def _enable_ldap3_logging(app):
+    """
+    Wire up the ``ldap3`` library logger so its debug messages are visible.
+
+    ldap3 attaches only a ``NullHandler`` to its ``ldap3`` logger, so by default
+    its messages are discarded. This is intentional on ldap3's side, but makes
+    it hard to diagnose slow or failing LDAP lookups.
+
+    If ``EDUMFA_LDAP_LOGGING`` is set to a truthy value in the config file, the
+    ``ldap3`` logger is set to the level from ``EDUMFA_LDAP_LOGGING_LEVEL``
+    (default ``DEBUG``) and attached to the handlers that the ``edumfa`` logger
+    uses. The verbosity of the ldap3 output can be controlled with
+    ``EDUMFA_LDAP_LOGGING_DETAIL`` (one of off/error/basic/protocol/network/
+    extended, default ``extended``).
+
+    This function never raises: if ldap3 is unavailable or cannot be
+    reconfigured, a warning is logged and startup continues.
+    """
+    if not app.config.get("EDUMFA_LDAP_LOGGING"):
+        return
+
+    try:
+        from ldap3.utils import log as ldap3_log
+    except Exception as exx:  # pragma: no cover - ldap3 is a hard dependency
+        logging.getLogger(__name__).warning(f"Could not enable ldap3 logging: {exx!r}")
+        return
+
+    level_name = str(app.config.get("EDUMFA_LDAP_LOGGING_LEVEL", "DEBUG")).upper()
+    level = getattr(logging, level_name, logging.DEBUG)
+
+    detail_name = str(app.config.get("EDUMFA_LDAP_LOGGING_DETAIL", "extended")).lower()
+    detail = _LDAP3_DETAIL_LEVELS.get(detail_name, ldap3_log.EXTENDED)
+
+    try:
+        ldap3_log.set_library_log_activation_level(level)
+        ldap3_log.set_library_log_detail_level(detail)
+    except ValueError as exx:  # pragma: no cover - defensive
+        logging.getLogger(__name__).warning(
+            f"Could not set ldap3 log level/detail: {exx!r}"
+        )
+
+    ldap_logger = logging.getLogger("ldap3")
+    ldap_logger.setLevel(level)
+    # Attach the handlers of the eduMFA logger so ldap3 messages end up in the
+    # same destination (file/console) as the rest of the application logs.
+    for handler in logging.getLogger("edumfa").handlers:
+        ldap_logger.addHandler(handler)
+    ldap_logger.propagate = False
+    logging.getLogger(__name__).info(
+        f"Enabled ldap3 logging (level={logging.getLevelName(level)!r}, "
+        f"detail={detail_name!r})."
+    )
+
+
 def create_app(
     config_name="development",
     config_file="/etc/edumfa/edumfa.cfg",
@@ -230,6 +295,12 @@ def create_app(
         DEFAULT_LOGGING_CONFIG["handlers"]["file"]["level"] = level
         DEFAULT_LOGGING_CONFIG["loggers"]["edumfa"]["level"] = level
         logging.config.dictConfig(DEFAULT_LOGGING_CONFIG)
+
+    # Optionally enable the debug logging of the ldap3 library. Since ldap3
+    # only attaches a NullHandler, its messages are swallowed unless we wire it
+    # up to the existing handlers. This is useful to diagnose slow or failing
+    # LDAP lookups (see EDUMFA_LDAP_LOGGING).
+    _enable_ldap3_logging(app)
 
     babel = Babel(app, locale_selector=get_locale)
 
