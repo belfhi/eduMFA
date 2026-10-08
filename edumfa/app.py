@@ -65,6 +65,7 @@ from edumfa.config import config
 from edumfa.lib import queue
 from edumfa.lib.crypto import init_hsm
 from edumfa.lib.log import DEFAULT_LOGGING_CONFIG
+from edumfa.lib.tracing import instrument_network_tracing
 from edumfa.models import db
 from edumfa.webui.certificate import cert_blueprint
 from edumfa.webui.login import get_accepted_language, login_blueprint
@@ -301,6 +302,11 @@ def create_app(
     # up to the existing handlers. This is useful to diagnose slow or failing
     # LDAP lookups (see EDUMFA_LDAP_LOGGING).
     _enable_ldap3_logging(app)
+
+    # If tracing is enabled, also instrument the low-level DNS/TCP/TLS calls so
+    # that e.g. LDAP lookup latency can be split into DNS, connect, TLS and bind
+    # time in the traces. This is a no-op if no tracer provider is configured.
+    instrument_network_tracing()
 
     babel = Babel(app, locale_selector=get_locale)
 

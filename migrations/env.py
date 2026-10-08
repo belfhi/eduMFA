@@ -12,7 +12,17 @@ config = context.config
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
-fileConfig(config.config_file_name)
+#
+# When eduMFA runs the migration through ``edumfa-manage`` the application has
+# already configured logging (e.g. JSON logging from ``logging.yml``). In that
+# case we must not let Alembic's own plain-text configuration override it.
+# ``fileConfig`` always (re)configures the ``alembic``/``flask_migrate`` loggers
+# with the formatter from ``alembic.ini``, which is why the migration output
+# would otherwise not match the rest of the application logs.
+import logging
+
+if not logging.getLogger("edumfa").handlers:
+    fileConfig(config.config_file_name)
 
 # add your model's MetaData object here
 # for 'autogenerate' support

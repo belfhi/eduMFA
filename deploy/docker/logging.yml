@@ -25,6 +25,12 @@
             "level": "INFO",
             "propagate": 0
         },
+        "flask_migrate": {
+            "handlers": ["stdhandler"],
+            "qualname": "flask_migrate",
+            "level": "WARN",
+            "propagate": 0
+        },
         "sqlalchemy.engine": {
             "handlers": ["stdhandler"],
             "qualname": "sqlalchemy.engine",

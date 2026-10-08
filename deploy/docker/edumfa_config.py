@@ -81,6 +81,12 @@ EDUMFA_LOGCONFIG = get_var("EDUMFA_LOGCONFIG", "/opt/edumfa/logging.yml")
 EDUMFA_UI_DEACTIVATED = get_var("EDUMFA_UI_DEACTIVATED", "False").lower() == "true"
 EDUMFA_AUDIT_SQL_TRUNCATE = True
 EDUMFA_NODE = gethostname()
+if edumfa_ldap_logging := get_var("EDUMFA_LDAP_LOGGING", ""):
+    EDUMFA_LDAP_LOGGING = edumfa_ldap_logging.lower() == "true"
+    if edumfa_ldap_logging_level := get_var("EDUMFA_LDAP_LOGGING_LEVEL", ""):
+        EDUMFA_LDAP_LOGGING_LEVEL = edumfa_ldap_logging_level
+    if edumfa_ldap_logging_detail := get_var("EDUMFA_LDAP_LOGGING_DETAIL", ""):
+        EDUMFA_LDAP_LOGGING_DETAIL = edumfa_ldap_logging_detail
 if sqlalchemy_options := get_var("SQLALCHEMY_ENGINE_OPTIONS", ""):
     SQLALCHEMY_ENGINE_OPTIONS = str_to_dict(
         sqlalchemy_options, "SQLALCHEMY_ENGINE_OPTIONS"

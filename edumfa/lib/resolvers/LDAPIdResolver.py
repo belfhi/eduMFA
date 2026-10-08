@@ -279,6 +279,7 @@ class IdResolver(UserIdResolver):
 
     def __init__(self):
         self.i_am_bound = False
+        self.l = None
         self.uri = ""
         self.basedn = ""
         self.binddn = ""
@@ -516,30 +517,80 @@ class IdResolver(UserIdResolver):
 
         return dn
 
+    def _connection_is_alive(self):
+        """
+        Check whether the current service-account connection ``self.l`` is still
+        usable.
+
+        A connection can go stale between requests because the LDAP server, a
+        firewall or a load balancer closes idle TCP connections. With ldap3's
+        ``RESTARTABLE`` strategy such a stale connection is silently reopened and
+        re-bound on the next operation, which shows up as an unexpectedly slow
+        search. By checking liveness up front we can reconnect and re-bind
+        explicitly (and visibly) instead.
+
+        The check is intentionally conservative: it only reports a connection as
+        dead if ldap3 positively indicates this. If the state cannot be
+        determined (e.g. for test doubles), the connection is assumed to be
+        alive so that we do not introduce unnecessary reconnects.
+
+        :return: True if the connection is (probably) open and bound
+        """
+        conn = self.l
+        if conn is None:
+            return False
+        try:
+            if bool(getattr(conn, "closed", False)):
+                return False
+            bound = getattr(conn, "bound", None)
+            if bound is not None and not bool(bound):
+                return False
+            socket = getattr(conn, "socket", "unknown")
+            if socket is None:
+                # ldap3 resets ``socket`` to None when the connection was closed
+                return False
+            return True
+        except Exception as exx:  # pragma: no cover - defensive
+            log.debug(f"Could not determine LDAP connection state: {exx!r}")
+            return True
+
     def _bind(self):
-        if not self.i_am_bound:
-            with trace_span("ldap.bind") as span:
-                span.set_attribute("edumfa.ldap.uri", self.uri)
-                span.set_attribute("edumfa.ldap.binddn", self.binddn)
-                with trace_span("ldap.bind.get_serverpool"):
-                    if not self.serverpool:
-                        self.serverpool = self.get_serverpool_instance(self.get_info)
-                with trace_span("ldap.bind.create_connection"):
-                    self.l = self.create_connection(
-                        authtype=self.authtype,
-                        server=self.serverpool,
-                        user=self.binddn,
-                        password=self.bindpw,
-                        receive_timeout=self.timeout,
-                        auto_referrals=not self.noreferrals,
-                        start_tls=self.start_tls,
-                        keytabfile=self.keytabfile,
-                    )
-                with trace_span("ldap.bind.bind") as bind_span:
-                    bind_span.set_attribute("edumfa.ldap.timeout", self.timeout)
-                    if not self.l.bind():
-                        raise Exception("Wrong credentials")
-                self.i_am_bound = True
+        # Reuse the existing connection only if it is still alive. Otherwise we
+        # drop it and perform a full bind (this is traced, so a reconnect is
+        # visible in the trace instead of being hidden inside the next search).
+        if self.i_am_bound and self._connection_is_alive():
+            return
+
+        with trace_span("ldap.bind") as span:
+            span.set_attribute("edumfa.ldap.uri", self.uri)
+            span.set_attribute("edumfa.ldap.binddn", self.binddn)
+            span.set_attribute("edumfa.ldap.rebind", bool(self.i_am_bound))
+            # Discard a possibly stale connection so that a fresh one is created.
+            if self.l is not None:
+                try:
+                    self.l.unbind()
+                except Exception:  # pragma: no cover - the connection may be dead
+                    pass
+                self.l = None
+            with trace_span("ldap.bind.get_serverpool"):
+                if not self.serverpool:
+                    self.serverpool = self.get_serverpool_instance(self.get_info)
+            with trace_span("ldap.bind.create_connection"):
+                self.l = self.create_connection(
+                    authtype=self.authtype,
+                    server=self.serverpool,
+                    user=self.binddn,
+                    password=self.bindpw,
+                    receive_timeout=self.timeout,
+                    auto_referrals=not self.noreferrals,
+                    start_tls=self.start_tls,
+                    keytabfile=self.keytabfile,
+                )
+            with trace_span("ldap.bind.bind") as bind_span:
+                bind_span.set_attribute("edumfa.ldap.timeout", self.timeout)
+                if not self.l.bind():
+                    raise Exception("Wrong credentials")
+            self.i_am_bound = True
 
     @staticmethod
     def _get_tls_context(
@@ -907,6 +958,7 @@ class IdResolver(UserIdResolver):
         # The configuration might have changed. We reset the serverpool
         self.serverpool = None
         self.i_am_bound = False
+        self.l = None
 
         return self
 

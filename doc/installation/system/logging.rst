@@ -16,6 +16,19 @@ Usually it is set to::
 
    EDUMFA_LOGFILE = "/var/log/edumfa/edumfa.log"
 
+LDAP
+~~~~
+
+To diagnose slow or failing LDAP lookups, the debug logging of the underlying
+``ldap3`` library can be enabled with::
+
+   EDUMFA_LDAP_LOGGING = True
+   EDUMFA_LDAP_LOGGING_LEVEL = DEBUG      # optional, default: DEBUG
+   EDUMFA_LDAP_LOGGING_DETAIL = extended  # optional, one of off/error/basic/protocol/network/extended
+
+In the container image these can also be set as environment variables of the
+same name.
+
 .. _advanced_logging:
 
 Advanced Logging

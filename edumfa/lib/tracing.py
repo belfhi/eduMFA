@@ -36,6 +36,8 @@ dictionary lookup decides whether anything needs to be done.
 """
 
 import logging
+import socket
+import ssl
 from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
@@ -122,3 +124,92 @@ class _NoOpSpan:
 
     def set_status(self, status):
         return self
+
+
+_NETWORK_INSTRUMENTED = False
+
+
+def instrument_network_tracing():
+    """
+    Wrap the standard-library DNS, TCP and TLS functions so that their timings
+    show up as OpenTelemetry spans.
+
+    Libraries like ldap3 resolve hostnames with ``socket.getaddrinfo``, open
+    TCP connections with ``socket.socket.connect`` and perform TLS handshakes
+    with ``ssl.SSLContext.wrap_socket``. None of these are covered by the usual
+    OpenTelemetry auto-instrumentation, so DNS and TLS latency is otherwise
+    invisible in traces.
+
+    This function patches those functions so that each call is wrapped in a
+    span (``dns.getaddrinfo``, ``net.tcp.connect`` and ``tls.handshake``). It is
+    idempotent and a no-op if tracing is not enabled. The patches are only
+    applied once per process.
+
+    Because these are very low-level functions, the spans are only created when
+    there is an active span (i.e. the call happens inside a traced request).
+    Otherwise the original function is called directly.
+    """
+    global _NETWORK_INSTRUMENTED
+    if _NETWORK_INSTRUMENTED or not tracing_enabled():
+        return
+    _NETWORK_INSTRUMENTED = True
+
+    original_getaddrinfo = socket.getaddrinfo
+    original_connect = socket.socket.connect
+    original_wrap_socket = ssl.SSLContext.wrap_socket
+
+    def getaddrinfo(*args, **kwargs):
+        host = args[0] if args else kwargs.get("host")
+        with _network_span("dns.getaddrinfo", {"net.peer.name": host}) as span:
+            addrs = original_getaddrinfo(*args, **kwargs)
+            if span is not None:
+                span.set_attribute("net.addr.count", len(addrs))
+            return addrs
+
+    def connect(self_socket, address, *args, **kwargs):
+        host = None
+        port = None
+        if isinstance(address, tuple) and len(address) >= 2:
+            host, port = address[0], address[1]
+        attrs = {"net.peer.name": str(host) if host else None}
+        if port is not None:
+            attrs["net.peer.port"] = port
+        with _network_span("net.tcp.connect", attrs):
+            return original_connect(self_socket, address, *args, **kwargs)
+
+    def wrap_socket(self_context, sock, *args, **kwargs):
+        server_hostname = kwargs.get("server_hostname")
+        do_handshake = kwargs.get("do_handshake_on_connect", True)
+        attrs = {"net.peer.name": server_hostname}
+        # The time of the TLS handshake is what we are interested in. If the
+        # caller defers the handshake, the span covers only the wrapping.
+        attrs["tls.deferred_handshake"] = not do_handshake
+        with _network_span("tls.handshake", attrs):
+            return original_wrap_socket(self_context, sock, *args, **kwargs)
+
+    socket.getaddrinfo = getaddrinfo
+    socket.socket.connect = connect
+    ssl.SSLContext.wrap_socket = wrap_socket
+    log.info("Instrumented DNS/TCP/TLS for OpenTelemetry tracing.")
+
+
+@contextmanager
+def _network_span(name, attributes):
+    """
+    Like :func:`trace_span`, but only creates a span if there is already an
+    active (i.e. recording) span. This avoids flooding the traces with DNS/TCP
+    lookups that happen outside of a request.
+
+    Yields the span or ``None`` if no span was created.
+    """
+    current = None
+    if _OTEL_AVAILABLE:
+        try:
+            current = trace.get_current_span()
+        except Exception:  # pragma: no cover - defensive
+            current = None
+    if current is None or not current.is_recording():
+        yield None
+        return
+    with trace_span(name, attributes) as span:
+        yield span
