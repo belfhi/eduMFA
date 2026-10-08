@@ -29,6 +29,7 @@ from typing_extensions import ParamSpec, TypeVar
 
 from edumfa.lib.audit import getAudit
 from edumfa.lib.config import get_config_object
+from edumfa.lib.tracing import trace_span
 from edumfa.lib.utils import fetch_one_resource
 from edumfa.lib.utils.export import register_export, register_import
 from edumfa.models import EventHandler, EventHandlerOption, db
@@ -69,85 +70,99 @@ class event:
             # here we have to evaluate the event configuration from the
             # DB table eventhandler and based on the self.eventname etc...
             # do Pre-Event Handling
-            e_handles = self.g.event_config.get_handled_events(
-                self.eventname, position="pre"
-            )
-            for e_handler_def in e_handles:
-                log.debug(f"Pre-Handling event {self.eventname} with {e_handler_def}")
-                event_handler_name = e_handler_def.get("handlermodule")
-                event_handler = get_handler_object(event_handler_name)
-                # The "action is determined by the event configuration
-                # In the options we can pass the mailserver configuration
-                options = {
-                    "request": self.request,
-                    "g": self.g,
-                    "handler_def": e_handler_def,
-                }
-                if event_handler.check_condition(options=options):
+            with trace_span(f"event.pre.{self.eventname}"):
+                e_handles = self.g.event_config.get_handled_events(
+                    self.eventname, position="pre"
+                )
+                for e_handler_def in e_handles:
                     log.debug(
-                        f"Pre-Handling event {self.eventname} with options{options}"
+                        f"Pre-Handling event {self.eventname} with {e_handler_def}"
                     )
-                    # create a new audit object for this action
-                    event_audit = getAudit(self.g.audit_object.config)
-                    # copy all values from the original audit entry
-                    event_audit_data = dict(self.g.audit_object.audit_data)
-                    event_audit_data["action"] = (
-                        f"PRE-EVENT {self.eventname}>>{e_handler_def.get('handlermodule')}:{e_handler_def.get('action')}"
-                    )
-                    event_audit_data["action_detail"] = (
-                        f"{e_handler_def.get('options')}"
-                    )
-                    event_audit_data["info"] = e_handler_def.get("name")
-                    event_audit.log(event_audit_data)
+                    event_handler_name = e_handler_def.get("handlermodule")
+                    event_handler = get_handler_object(event_handler_name)
+                    # The "action is determined by the event configuration
+                    # In the options we can pass the mailserver configuration
+                    options = {
+                        "request": self.request,
+                        "g": self.g,
+                        "handler_def": e_handler_def,
+                    }
+                    if event_handler.check_condition(options=options):
+                        log.debug(
+                            f"Pre-Handling event {self.eventname} with options{options}"
+                        )
+                        # create a new audit object for this action
+                        event_audit = getAudit(self.g.audit_object.config)
+                        # copy all values from the original audit entry
+                        event_audit_data = dict(self.g.audit_object.audit_data)
+                        event_audit_data["action"] = (
+                            f"PRE-EVENT {self.eventname}>>{e_handler_def.get('handlermodule')}:{e_handler_def.get('action')}"
+                        )
+                        event_audit_data["action_detail"] = (
+                            f"{e_handler_def.get('options')}"
+                        )
+                        event_audit_data["info"] = e_handler_def.get("name")
+                        event_audit.log(event_audit_data)
 
-                    result = event_handler.do(
-                        e_handler_def.get("action"), options=options
-                    )
-                    # set audit object to success
-                    event_audit.log({"success": result})
-                    event_audit.finalize_log()
+                        with trace_span(f"event.pre.{self.eventname}.do") as span:
+                            span.set_attribute(
+                                "edumfa.handler_module", event_handler_name or ""
+                            )
+                            result = event_handler.do(
+                                e_handler_def.get("action"), options=options
+                            )
+                        # set audit object to success
+                        event_audit.log({"success": result})
+                        event_audit.finalize_log()
 
             f_result = func(*args, **kwds)
 
             # Post-Event Handling
-            e_handles = self.g.event_config.get_handled_events(self.eventname)
-            for e_handler_def in e_handles:
-                log.debug(f"Post-Handling event {self.eventname} with {e_handler_def}")
-                event_handler_name = e_handler_def.get("handlermodule")
-                event_handler = get_handler_object(event_handler_name)
-                # The "action is determined by the event configuration
-                # In the options we can pass the mailserver configuration
-                options = {
-                    "request": self.request,
-                    "g": self.g,
-                    "response": f_result,
-                    "handler_def": e_handler_def,
-                }
-                if event_handler.check_condition(options=options):
+            with trace_span(f"event.post.{self.eventname}"):
+                e_handles = self.g.event_config.get_handled_events(self.eventname)
+                for e_handler_def in e_handles:
                     log.debug(
-                        f"Post-Handling event {self.eventname} with options{options}"
+                        f"Post-Handling event {self.eventname} with {e_handler_def}"
                     )
-                    # create a new audit object
-                    event_audit = getAudit(self.g.audit_object.config)
-                    # copy all values from the original audit entry
-                    event_audit_data = dict(self.g.audit_object.audit_data)
-                    event_audit_data["action"] = (
-                        f"POST-EVENT {self.eventname}>>{e_handler_def.get('handlermodule')}:{e_handler_def.get('action')}"
-                    )
-                    event_audit_data["action_detail"] = (
-                        f"{e_handler_def.get('options')}"
-                    )
-                    event_audit_data["info"] = e_handler_def.get("name")
-                    event_audit.log(event_audit_data)
+                    event_handler_name = e_handler_def.get("handlermodule")
+                    event_handler = get_handler_object(event_handler_name)
+                    # The "action is determined by the event configuration
+                    # In the options we can pass the mailserver configuration
+                    options = {
+                        "request": self.request,
+                        "g": self.g,
+                        "response": f_result,
+                        "handler_def": e_handler_def,
+                    }
+                    if event_handler.check_condition(options=options):
+                        log.debug(
+                            f"Post-Handling event {self.eventname} with options{options}"
+                        )
+                        # create a new audit object
+                        event_audit = getAudit(self.g.audit_object.config)
+                        # copy all values from the original audit entry
+                        event_audit_data = dict(self.g.audit_object.audit_data)
+                        event_audit_data["action"] = (
+                            f"POST-EVENT {self.eventname}>>{e_handler_def.get('handlermodule')}:{e_handler_def.get('action')}"
+                        )
+                        event_audit_data["action_detail"] = (
+                            f"{e_handler_def.get('options')}"
+                        )
+                        event_audit_data["info"] = e_handler_def.get("name")
+                        event_audit.log(event_audit_data)
 
-                    result = event_handler.do(
-                        e_handler_def.get("action"), options=options
-                    )
-                    # In case the handler has modified the response
-                    f_result = options.get("response")
-                    # set audit object to success
-                    event_audit.log({"success": result})
-                    event_audit.finalize_log()
+                        with trace_span(f"event.post.{self.eventname}.do") as span:
+                            span.set_attribute(
+                                "edumfa.handler_module", event_handler_name or ""
+                            )
+                            result = event_handler.do(
+                                e_handler_def.get("action"), options=options
+                            )
+                        # In case the handler has modified the response
+                        f_result = options.get("response")
+                        # set audit object to success
+                        event_audit.log({"success": result})
+                        event_audit.finalize_log()
 
             return f_result
 

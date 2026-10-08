@@ -86,6 +86,7 @@ from edumfa.lib.event import EventConfiguration, event
 from edumfa.lib.framework import get_app_config_value
 from edumfa.lib.policy import REMOTE_USER, PolicyClass
 from edumfa.lib.realm import get_default_realm, realm_is_defined
+from edumfa.lib.tracing import trace_span
 from edumfa.lib.user import User, log_used_user, split_user
 from edumfa.lib.utils import get_client_ip, hexlify_and_unicode, to_unicode
 
@@ -100,16 +101,23 @@ def before_request():
     """
     This is executed before the request
     """
-    ensure_no_config_object()
-    request.all_data = get_all_params(request)
-    edumfa_server = get_app_config_value(
-        "EDUMFA_AUDIT_SERVERNAME", get_edumfa_node(request.host)
-    )
-    g.policy_object = PolicyClass()
-    g.audit_object = getAudit(current_app.config)
-    g.event_config = EventConfiguration()
+    with trace_span("auth.before_request.ensure_no_config_object"):
+        ensure_no_config_object()
+    with trace_span("auth.before_request.get_all_params"):
+        request.all_data = get_all_params(request)
+    with trace_span("auth.before_request.get_edumfa_node"):
+        edumfa_server = get_app_config_value(
+            "EDUMFA_AUDIT_SERVERNAME", get_edumfa_node(request.host)
+        )
+    with trace_span("auth.before_request.PolicyClass"):
+        g.policy_object = PolicyClass()
+    with trace_span("auth.before_request.getAudit"):
+        g.audit_object = getAudit(current_app.config)
+    with trace_span("auth.before_request.EventConfiguration"):
+        g.event_config = EventConfiguration()
     # access_route contains the ip addresses of all clients, hops and proxies.
-    g.client_ip = get_client_ip(request, get_from_config(SYSCONF.OVERRIDECLIENT))
+    with trace_span("auth.before_request.get_client_ip"):
+        g.client_ip = get_client_ip(request, get_from_config(SYSCONF.OVERRIDECLIENT))
     # Save the HTTP header in the localproxy object
     g.request_headers = request.headers
     g.serial = getParam(request.all_data, "serial", default=None)
@@ -135,7 +143,9 @@ def before_request():
         realm = getParam(request.all_data, "realm") or realm or get_default_realm()
         # Prefill the request.User. This is used by some pre-event handlers
         try:
-            request.User = User(loginname, realm)
+            with trace_span("auth.before_request.resolve_user") as span:
+                span.set_attribute("edumfa.realm", realm)
+                request.User = User(loginname, realm)
         except Exception as e:
             request.User = None
             log.warning(f"Problem resolving user {loginname} in realm {realm}: {e}.")
@@ -294,32 +304,40 @@ def get_auth_token():
         # 2. in a realm
         # 2a. is an admin realm
         authtype = "remote_user "
-        if db_admin_exist(username):
-            role = ROLE.ADMIN
-            admin_auth = True
-            g.audit_object.log(
-                {
-                    "success": True,
-                    "user": "",
-                    "administrator": username,
-                    "info": "internal admin",
-                }
-            )
-            user_obj = User()
-        else:
-            # check, if the user exists
-            g.audit_object.log(
-                {
-                    "user": user_obj.login,
-                    "realm": user_obj.realm,
-                    "info": log_used_user(user_obj),
-                }
-            )
-            if user_obj.exist():
-                user_auth = True
-                if user_obj.realm in superuser_realms:
-                    role = ROLE.ADMIN
-                    admin_auth = True
+        with trace_span("auth.verify_remote_user") as span:
+            span.set_attribute("edumfa.authtype", authtype)
+            with trace_span("auth.verify_remote_user.db_admin_exist") as sub:
+                is_db_admin = db_admin_exist(username)
+                sub.set_attribute("edumfa.db_admin_exist", is_db_admin)
+            if is_db_admin:
+                role = ROLE.ADMIN
+                admin_auth = True
+                g.audit_object.log(
+                    {
+                        "success": True,
+                        "user": "",
+                        "administrator": username,
+                        "info": "internal admin",
+                    }
+                )
+                user_obj = User()
+            else:
+                # check, if the user exists
+                g.audit_object.log(
+                    {
+                        "user": user_obj.login,
+                        "realm": user_obj.realm,
+                        "info": log_used_user(user_obj),
+                    }
+                )
+                with trace_span("auth.verify_remote_user.user_exist") as sub:
+                    user_exists = user_obj.exist()
+                    sub.set_attribute("edumfa.user_exists", user_exists)
+                if user_exists:
+                    user_auth = True
+                    if user_obj.realm in superuser_realms:
+                        role = ROLE.ADMIN
+                        admin_auth = True
 
     elif verify_db_admin(username, password):
         role = ROLE.ADMIN
@@ -350,9 +368,16 @@ def get_auth_token():
             for key, value in request.all_data.items():
                 if value and key not in ["g", "clientip"]:
                     options[key] = value
-            user_auth, role, details = check_webui_user(
-                user_obj, password, options=options, superuser_realms=superuser_realms
-            )
+            with trace_span("auth.check_webui_user") as span:
+                span.set_attribute("edumfa.realm", user_obj.realm)
+                span.set_attribute("edumfa.resolver", user_obj.resolver)
+                user_auth, role, details = check_webui_user(
+                    user_obj,
+                    password,
+                    options=options,
+                    superuser_realms=superuser_realms,
+                )
+                span.set_attribute("edumfa.user_auth", user_auth)
             details = details or {}
             serials = (
                 ",".join(
@@ -420,16 +445,20 @@ def get_auth_token():
         request.User = user_obj
 
     # If the HSM is not ready, we need to create the nonce in another way!
-    hsm = init_hsm()
+    with trace_span("auth.init_hsm") as span:
+        hsm = init_hsm()
+        span.set_attribute("edumfa.hsm_ready", bool(hsm.is_ready))
     if hsm.is_ready:
         nonce = geturandom(hex=True)
         # Add the role to the JWT, so that we can verify it internally
         # Add the authtype to the JWT, so that we could use it for access
         # definitions
-        rights = g.policy_object.ui_get_rights(role, realm, loginname, g.client_ip)
-        menus = g.policy_object.ui_get_main_menus(
-            {"username": loginname, "role": role, "realm": realm}, g.client_ip
-        )
+        with trace_span("auth.ui_get_rights"):
+            rights = g.policy_object.ui_get_rights(role, realm, loginname, g.client_ip)
+        with trace_span("auth.ui_get_main_menus"):
+            menus = g.policy_object.ui_get_main_menus(
+                {"username": loginname, "role": role, "realm": realm}, g.client_ip
+            )
     else:
         import os
 
@@ -440,19 +469,20 @@ def get_auth_token():
     # What is the log level?
     log_level = current_app.config.get("EDUMFA_LOGLEVEL", 30)
 
-    token = jwt.encode(
-        {
-            "username": loginname,
-            "realm": realm,
-            "nonce": nonce,
-            "role": role,
-            "authtype": authtype,
-            "exp": datetime.utcnow() + validity,
-            "rights": rights,
-        },
-        secret,
-        algorithm="HS256",
-    )
+    with trace_span("auth.jwt_encode"):
+        token = jwt.encode(
+            {
+                "username": loginname,
+                "realm": realm,
+                "nonce": nonce,
+                "role": role,
+                "authtype": authtype,
+                "exp": datetime.utcnow() + validity,
+                "rights": rights,
+            },
+            secret,
+            algorithm="HS256",
+        )
 
     # set the logged-in user for post-policies and post-events
     g.logged_in_user = {"username": loginname, "realm": realm, "role": role}

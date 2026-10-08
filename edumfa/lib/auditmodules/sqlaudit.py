@@ -57,6 +57,7 @@ from edumfa.lib.pooling import (
     REGISTRY_CONFIG_NAME,
     get_engine,
 )
+from edumfa.lib.tracing import trace_span
 from edumfa.lib.utils import censor_connect_string, is_true, truncate_comma_list
 from edumfa.models import Audit as LogEntry
 from edumfa.models import audit_column_length as column_length
@@ -91,9 +92,7 @@ def fn_to_isodate(element, compiler, **kw):
 @compiles(to_isodate)
 def fn_to_isodate(element, compiler, **kw):
     # The duplicate percent signs are necessary for two format substitutions
-    return (
-        f"date_format({compiler.process(element.clauses, **kw)}, '%%Y-%%m-%%d %%H:%%i:%%s')"
-    )
+    return f"date_format({compiler.process(element.clauses, **kw)}, '%%Y-%%m-%%d %%H:%%i:%%s')"
 
 
 class Audit(AuditBase):
@@ -143,13 +142,14 @@ class Audit(AuditBase):
             "EDUMFA_AUDIT_NO_PRIVATE_KEY_CHECK", False
         )
         if self.sign_data:
-            self.read_keys(
-                self.config.get("EDUMFA_AUDIT_KEY_PUBLIC"),
-                self.config.get("EDUMFA_AUDIT_KEY_PRIVATE"),
-            )
-            self.sign_object = Sign(
-                self.private, self.public, check_private_key=self.check_private_key
-            )
+            with trace_span("audit.init.read_keys_and_sign_object"):
+                self.read_keys(
+                    self.config.get("EDUMFA_AUDIT_KEY_PUBLIC"),
+                    self.config.get("EDUMFA_AUDIT_KEY_PRIVATE"),
+                )
+                self.sign_object = Sign(
+                    self.private, self.public, check_private_key=self.check_private_key
+                )
         # Read column_length from the config file
         config_column_length = self.config.get("EDUMFA_AUDIT_SQL_COLUMN_LENGTH", {})
         # fill the missing parts with the default from the models
@@ -303,82 +303,88 @@ class Audit(AuditBase):
         This method is used to log the data.
         It should hash the data and do a hash chain and sign the data
         """
-        try:
-            for entry, value in self.audit_data.items():
-                if isinstance(value, list):
-                    self.audit_data[entry] = ",".join(value)
-            if self.config.get("EDUMFA_AUDIT_SQL_TRUNCATE"):
-                self._truncate_data()
-            if "tokentype" in self.audit_data:
-                log.warning(
-                    "We have a wrong 'tokentype' key. This should not happen. Fix it!. "
-                    f"Error occurs in action: {self.audit_data.get('action')}."
-                )
-                if not "token_type" in self.audit_data:
-                    self.audit_data["token_type"] = self.audit_data.get("tokentype")
-            if self.audit_data.get("startdate"):
-                duration = datetime.datetime.now() - self.audit_data.get("startdate")
-            else:
-                duration = None
-            # We want to reduce the passkey events a bit...
-            if (
-                self.config.get("EDUMFA_REDUCE_SQLAUDIT") == "1"
-                or str(self.config.get("EDUMFA_REDUCE_SQLAUDIT")).lower() == "true"
-            ):
-                if (
-                    (
-                        self.audit_data.get("action")
-                        == "POST /validate/triggerchallenge"
-                        or "PRE-EVENT" in self.audit_data.get("action")
-                        or "POST-EVENT" in self.audit_data.get("action")
+        with trace_span("audit.finalize_log") as span:
+            span.set_attribute("edumfa.audit_action", self.audit_data.get("action"))
+            try:
+                for entry, value in self.audit_data.items():
+                    if isinstance(value, list):
+                        self.audit_data[entry] = ",".join(value)
+                if self.config.get("EDUMFA_AUDIT_SQL_TRUNCATE"):
+                    self._truncate_data()
+                if "tokentype" in self.audit_data:
+                    log.warning(
+                        "We have a wrong 'tokentype' key. This should not happen. Fix it!. "
+                        f"Error occurs in action: {self.audit_data.get('action')}."
                     )
-                    and self.audit_data.get("serial") == None
-                    and self.audit_data.get("user") == None
+                    if not "token_type" in self.audit_data:
+                        self.audit_data["token_type"] = self.audit_data.get("tokentype")
+                if self.audit_data.get("startdate"):
+                    duration = datetime.datetime.now() - self.audit_data.get(
+                        "startdate"
+                    )
+                else:
+                    duration = None
+                # We want to reduce the passkey events a bit...
+                if (
+                    self.config.get("EDUMFA_REDUCE_SQLAUDIT") == "1"
+                    or str(self.config.get("EDUMFA_REDUCE_SQLAUDIT")).lower() == "true"
                 ):
-                    self.session.close()
-                    self.audit_data = {}
-                    return
-            le = LogEntry(
-                action=self.audit_data.get("action"),
-                success=int(self.audit_data.get("success", 0)),
-                serial=self.audit_data.get("serial"),
-                token_type=self.audit_data.get("token_type"),
-                user=self.audit_data.get("user"),
-                realm=self.audit_data.get("realm"),
-                resolver=self.audit_data.get("resolver"),
-                administrator=self.audit_data.get("administrator"),
-                action_detail=self.audit_data.get("action_detail"),
-                info=self.audit_data.get("info"),
-                edumfa_server=self.audit_data.get("edumfa_server"),
-                client=self.audit_data.get("client", ""),
-                loglevel=self.audit_data.get("log_level"),
-                clearance_level=self.audit_data.get("clearance_level"),
-                policies=self.audit_data.get("policies"),
-                startdate=self.audit_data.get("startdate"),
-                duration=duration,
-                thread_id=self.audit_data.get("thread_id"),
-            )
-            self.session.add(le)
-            self.session.commit()
-            # Add the signature
-            if self.sign_data and self.sign_object:
-                s = self._log_to_string(le)
-                sign = self.sign_object.sign(s)
-                le.signature = sign
-                self.session.merge(le)
-                self.session.commit()
-        except Exception as exx:  # pragma: no cover
-            # in case of a Unicode Error in _log_to_string() we won't have
-            # a signature, but the log entry is available
-            log.error(f"exception {exx!r}")
-            log.error(f"DATA: {self.audit_data}")
-            log.debug(traceback.format_exc())
-            self.session.rollback()
+                    if (
+                        (
+                            self.audit_data.get("action")
+                            == "POST /validate/triggerchallenge"
+                            or "PRE-EVENT" in self.audit_data.get("action")
+                            or "POST-EVENT" in self.audit_data.get("action")
+                        )
+                        and self.audit_data.get("serial") == None
+                        and self.audit_data.get("user") == None
+                    ):
+                        self.session.close()
+                        self.audit_data = {}
+                        return
+                le = LogEntry(
+                    action=self.audit_data.get("action"),
+                    success=int(self.audit_data.get("success", 0)),
+                    serial=self.audit_data.get("serial"),
+                    token_type=self.audit_data.get("token_type"),
+                    user=self.audit_data.get("user"),
+                    realm=self.audit_data.get("realm"),
+                    resolver=self.audit_data.get("resolver"),
+                    administrator=self.audit_data.get("administrator"),
+                    action_detail=self.audit_data.get("action_detail"),
+                    info=self.audit_data.get("info"),
+                    edumfa_server=self.audit_data.get("edumfa_server"),
+                    client=self.audit_data.get("client", ""),
+                    loglevel=self.audit_data.get("log_level"),
+                    clearance_level=self.audit_data.get("clearance_level"),
+                    policies=self.audit_data.get("policies"),
+                    startdate=self.audit_data.get("startdate"),
+                    duration=duration,
+                    thread_id=self.audit_data.get("thread_id"),
+                )
+                with trace_span("audit.finalize_log.commit"):
+                    self.session.add(le)
+                    self.session.commit()
+                # Add the signature
+                if self.sign_data and self.sign_object:
+                    with trace_span("audit.finalize_log.sign_and_commit"):
+                        s = self._log_to_string(le)
+                        sign = self.sign_object.sign(s)
+                        le.signature = sign
+                        self.session.merge(le)
+                        self.session.commit()
+            except Exception as exx:  # pragma: no cover
+                # in case of a Unicode Error in _log_to_string() we won't have
+                # a signature, but the log entry is available
+                log.error(f"exception {exx!r}")
+                log.error(f"DATA: {self.audit_data}")
+                log.debug(traceback.format_exc())
+                self.session.rollback()
 
-        finally:
-            self.session.close()
-            # clear the audit data
-            self.audit_data = {}
+            finally:
+                self.session.close()
+                # clear the audit data
+                self.audit_data = {}
 
     def _check_missing(self, audit_id):
         """

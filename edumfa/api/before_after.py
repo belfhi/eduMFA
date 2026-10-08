@@ -48,6 +48,7 @@ from edumfa.lib.event import EventConfiguration
 from edumfa.lib.lifecycle import call_finalizers
 from edumfa.lib.policy import PolicyClass
 from edumfa.lib.token import get_token_owner, get_token_type
+from edumfa.lib.tracing import trace_span
 from edumfa.lib.user import User
 from edumfa.lib.utils import get_client_ip
 
@@ -99,15 +100,17 @@ def log_begin_request():
 
 @token_blueprint.teardown_app_request
 def teardown_request(exc):
-    try:
-        if g.audit_object.has_data:
-            g.audit_object.finalize_log()
-    except AttributeError:
-        # In certain error cases the before_request was not handled
-        # completely so that we do not have an audit_object
-        # Also during calling webui, there is not audit_object, yet.
-        pass
-    call_finalizers()
+    with trace_span("request.teardown.finalize_audit_log"):
+        try:
+            if g.audit_object.has_data:
+                g.audit_object.finalize_log()
+        except AttributeError:
+            # In certain error cases the before_request was not handled
+            # completely so that we do not have an audit_object
+            # Also during calling webui, there is not audit_object, yet.
+            pass
+    with trace_span("request.teardown.call_finalizers"):
+        call_finalizers()
     log.debug(f"End handling of request {request.full_path!r}")
 
 
@@ -165,8 +168,10 @@ def before_request():
     """
     # remove session from param and gather all parameters, either
     # from the Form data or from JSON in the request body.
-    ensure_no_config_object()
-    request.all_data = get_all_params(request)
+    with trace_span("request.before.ensure_no_config_object"):
+        ensure_no_config_object()
+    with trace_span("request.before.get_all_params"):
+        request.all_data = get_all_params(request)
     if g.logged_in_user.get("role") == "user":
         # A user is calling this API. First thing we do is restricting the user parameter.
         # ...to restrict token view, audit view or token actions.
@@ -174,7 +179,8 @@ def before_request():
         request.all_data["realm"] = g.logged_in_user.get("realm")
 
     try:
-        request.User = get_user_from_param(request.all_data)
+        with trace_span("request.before.get_user_from_param"):
+            request.User = get_user_from_param(request.all_data)
         # overwrite or set the resolver parameter in case of a logged in user
         if g.logged_in_user.get("role") == "user":
             request.all_data["resolver"] = request.User.resolver
@@ -187,11 +193,15 @@ def before_request():
         # policy and will not resolve to a user object
         request.User = User()
 
-    g.policy_object = PolicyClass()
-    g.audit_object = getAudit(current_app.config, g.startdate)
-    g.event_config = EventConfiguration()
+    with trace_span("request.before.PolicyClass"):
+        g.policy_object = PolicyClass()
+    with trace_span("request.before.getAudit"):
+        g.audit_object = getAudit(current_app.config, g.startdate)
+    with trace_span("request.before.EventConfiguration"):
+        g.event_config = EventConfiguration()
     # access_route contains the ip addresses of all clients, hops and proxies.
-    g.client_ip = get_client_ip(request, get_from_config(SYSCONF.OVERRIDECLIENT))
+    with trace_span("request.before.get_client_ip"):
+        g.client_ip = get_client_ip(request, get_from_config(SYSCONF.OVERRIDECLIENT))
     # Save the HTTP header in the localproxy object
     g.request_headers = request.headers
     edumfa_server = get_app_config_value(
@@ -201,11 +211,13 @@ def before_request():
     serial = getParam(request.all_data, "serial")
     if serial and not "*" in serial:
         g.serial = serial
-        tokentype = get_token_type(serial)
+        with trace_span("request.before.get_token_type"):
+            tokentype = get_token_type(serial)
         if not request.User:
             # We determine the user object by the given serial number
             try:
-                request.User = get_token_owner(serial) or User()
+                with trace_span("request.before.get_token_owner"):
+                    request.User = get_token_owner(serial) or User()
             except ResourceNotFoundError:
                 # The serial might not exist! This would raise an exception
                 pass

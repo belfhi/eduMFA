@@ -51,6 +51,7 @@ from .realm import (
     realm_is_defined,
 )
 from .resolver import get_resolver_object, get_resolver_type
+from .tracing import trace_span
 from .usercache import cache_username, delete_user_cache, user_cache, user_init
 
 log = logging.getLogger(__name__)
@@ -101,24 +102,31 @@ class User:
 
     @user_cache(user_init)
     def _get_user_from_userstore(self):
-        if not self.resolver:
-            # set the resolver implicitly!
-            self._get_resolvers()
+        with trace_span("user.get_user_from_userstore") as span:
+            span.set_attribute("edumfa.realm", self.realm)
+            span.set_attribute("edumfa.login", self.login)
+            if not self.resolver:
+                # set the resolver implicitly!
+                self._get_resolvers()
 
-        # Get Identifiers
-        if self.resolver:
-            y = get_resolver_object(self.resolver)
-            if y is None:
-                raise UserError(f"The resolver '{self.resolver}' does not exist!")
-            if self.uid is None:
-                # Determine the uid
-                self.uid = y.getUserId(self.login)
-            if not self.login:
-                # Determine the login if it does not exist or
-                self.used_login = self.login = y.getUsername(self.uid)
-            if y.has_multiple_loginnames:
-                # if the resolver has multiple logins the primary login might be another value!
-                self.login = y.getUsername(self.uid)
+            # Get Identifiers
+            if self.resolver:
+                y = get_resolver_object(self.resolver)
+                if y is None:
+                    raise UserError(f"The resolver '{self.resolver}' does not exist!")
+                span.set_attribute("edumfa.resolver", self.resolver)
+                if self.uid is None:
+                    # Determine the uid
+                    with trace_span("user.resolver.getUserId"):
+                        self.uid = y.getUserId(self.login)
+                if not self.login:
+                    # Determine the login if it does not exist or
+                    with trace_span("user.resolver.getUsername"):
+                        self.used_login = self.login = y.getUsername(self.uid)
+                if y.has_multiple_loginnames:
+                    # if the resolver has multiple logins the primary login might be another value!
+                    with trace_span("user.resolver.getUsername.multiple"):
+                        self.login = y.getUsername(self.uid)
 
     def is_empty(self):
         # ignore if only resolver is set! as it makes no sense
@@ -247,7 +255,11 @@ class User:
             log.info(f"Resolver {resolvername!r} not found!")
             return False
         else:
-            uid = y.getUserId(self.login)
+            with trace_span("user.locate_user_in_resolver") as span:
+                span.set_attribute("edumfa.resolver", resolvername)
+                span.set_attribute("edumfa.login", self.login)
+                uid = y.getUserId(self.login)
+                span.set_attribute("edumfa.uid_found", uid not in ["", None])
             if uid not in ["", None]:
                 log.info(f"user {self.login!r} found in resolver {resolvername!r}")
                 log.info(f"userid resolved to {uid!r} ")
@@ -436,13 +448,19 @@ class User:
             log.info(
                 f"User {self.login!r} from realm {self.realm!r} tries to authenticate"
             )
-            res = self._get_resolvers()
+            with trace_span("user.check_password.get_resolvers") as span:
+                res = self._get_resolvers()
+                span.set_attribute("edumfa.resolver_count", len(res))
             # Now we know, the resolvers of this user and we can verify the
             # password
             if len(res) == 1:
                 y = get_resolver_object(self.resolver)
                 uid, _rtype, _rname = self.get_user_identifiers()
-                if y.checkPass(uid, password):
+                with trace_span("user.check_password.resolver_checkPass") as span:
+                    span.set_attribute("edumfa.resolver", self.resolver)
+                    span.set_attribute("edumfa.rtype", self.rtype)
+                    password_valid = y.checkPass(uid, password)
+                if password_valid:
                     success = f"{self.login}@{self.realm}"
                     log.debug(f"Successfully authenticated user {self!r}.")
                 else:

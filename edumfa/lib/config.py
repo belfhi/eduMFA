@@ -41,6 +41,7 @@ from edumfa.lib.framework import (
     get_app_local_store,
     get_request_local_store,
 )
+from edumfa.lib.tracing import trace_span
 from edumfa.lib.utils import to_list
 from edumfa.lib.utils.export import register_export, register_import
 
@@ -112,94 +113,111 @@ class SharedConfigClass:
             or self.timestamp + datetime.timedelta(seconds=check_reload_config)
             < datetime.datetime.now()
         ):
-            db_ts = Config.query.filter_by(Key=EDUMFA_TIMESTAMP).first()
-            if reload_db(self.timestamp, db_ts):
-                log.debug("Reloading shared config from database")
-                config = {}
-                resolverconfig = {}
-                realmconfig = {}
-                default_realm = None
-                policies = []
-                events = []
-                caconnectors = []
-                # Load system configuration
-                for sysconf in Config.query.all():
-                    config[sysconf.Key] = {
-                        "Value": sysconf.Value,
-                        "Type": sysconf.Type,
-                        "Description": sysconf.Description,
-                    }
-                # Load resolver configuration
-                for resolver in Resolver.query.all():
-                    resolverdef = {
-                        "type": resolver.rtype,
-                        "resolvername": resolver.name,
-                        "censor_keys": [],
-                    }
-                    data = {}
-                    for rconf in resolver.config_list:
-                        if rconf.Type == "password":
-                            value = decryptPassword(rconf.Value)
-                            resolverdef["censor_keys"].append(rconf.Key)
-                        else:
-                            value = rconf.Value
-                        data[rconf.Key] = value
-                    resolverdef["data"] = data
-                    resolverconfig[resolver.name] = resolverdef
-                # Load realm configuration
-                for realm in Realm.query.all():
-                    if realm.default:
-                        default_realm = realm.name
-                    realmdef = {
-                        "id": realm.id,
-                        "option": realm.option,
-                        "default": realm.default,
-                        "resolver": [],
-                    }
-                    for x in realm.resolver_list:
-                        realmdef["resolver"].append(
-                            {
-                                "priority": x.priority,
-                                "name": x.resolver.name,
-                                "type": x.resolver.rtype,
-                            }
-                        )
-                    realmconfig[realm.name] = realmdef
-                # Load all policies
-                for pol in Policy.query.all():
-                    policies.append(pol.get())
-                # Load all events
-                for event in EventHandler.query.order_by(EventHandler.ordering):
-                    events.append(event.get())
-                # Load all CA connectors
-                from edumfa.lib.caconnector import get_caconnector_object
+            with trace_span("config.reload_from_db.check_timestamp") as span:
+                db_ts = Config.query.filter_by(Key=EDUMFA_TIMESTAMP).first()
+                needs_reload = reload_db(self.timestamp, db_ts)
+                span.set_attribute("edumfa.config_needs_reload", needs_reload)
+            if needs_reload:
+                with trace_span("config.reload_from_db.reload"):
+                    self._do_reload_from_db()
 
-                for ca in CAConnector.query.all():
-                    try:
-                        ca_obj = get_caconnector_object(ca.name)
-                        caconnectors.append(
-                            {
-                                "connectorname": ca.name,
-                                "type": ca.catype,
-                                "data": ca_obj.config,
-                                "templates": ca_obj.get_templates(),
-                            }
-                        )
-                    except Exception as exx:  # pragma: no cover
-                        log.debug(traceback.format_exc())
-                        log.error(exx)
+    def _do_reload_from_db(self):
+        log.debug("Reloading shared config from database")
+        config = {}
+        resolverconfig = {}
+        realmconfig = {}
+        default_realm = None
+        policies = []
+        events = []
+        caconnectors = []
+        # Load system configuration
+        with trace_span("config.reload_from_db.load_sysconf"):
+            for sysconf in Config.query.all():
+                config[sysconf.Key] = {
+                    "Value": sysconf.Value,
+                    "Type": sysconf.Type,
+                    "Description": sysconf.Description,
+                }
+        # Load resolver configuration
+        with trace_span("config.reload_from_db.load_resolvers") as span:
+            for resolver in Resolver.query.all():
+                resolverdef = {
+                    "type": resolver.rtype,
+                    "resolvername": resolver.name,
+                    "censor_keys": [],
+                }
+                data = {}
+                for rconf in resolver.config_list:
+                    if rconf.Type == "password":
+                        value = decryptPassword(rconf.Value)
+                        resolverdef["censor_keys"].append(rconf.Key)
+                    else:
+                        value = rconf.Value
+                    data[rconf.Key] = value
+                resolverdef["data"] = data
+                resolverconfig[resolver.name] = resolverdef
+            span.set_attribute("edumfa.resolver_count", len(resolverconfig))
+        # Load realm configuration
+        with trace_span("config.reload_from_db.load_realms"):
+            for realm in Realm.query.all():
+                if realm.default:
+                    default_realm = realm.name
+                realmdef = {
+                    "id": realm.id,
+                    "option": realm.option,
+                    "default": realm.default,
+                    "resolver": [],
+                }
+                for x in realm.resolver_list:
+                    realmdef["resolver"].append(
+                        {
+                            "priority": x.priority,
+                            "name": x.resolver.name,
+                            "type": x.resolver.rtype,
+                        }
+                    )
+                realmconfig[realm.name] = realmdef
+        # Load all policies
+        with trace_span("config.reload_from_db.load_policies") as span:
+            for pol in Policy.query.all():
+                policies.append(pol.get())
+            span.set_attribute("edumfa.policy_count", len(policies))
+        # Load all events
+        with trace_span("config.reload_from_db.load_events") as span:
+            for event in EventHandler.query.order_by(EventHandler.ordering):
+                events.append(event.get())
+            span.set_attribute("edumfa.event_count", len(events))
+        # Load all CA connectors
+        with trace_span("config.reload_from_db.load_caconnectors") as span:
+            from edumfa.lib.caconnector import get_caconnector_object
 
-                # Finally, set the current timestamp
-                timestamp = datetime.datetime.now()
-                with self._config_lock:
-                    self.config = config
-                    self.resolver = resolverconfig
-                    self.realm = realmconfig
-                    self.default_realm = default_realm
-                    self.policies = policies
-                    self.events = events
-                    self.timestamp = timestamp
-                    self.caconnectors = caconnectors
+            for ca in CAConnector.query.all():
+                try:
+                    ca_obj = get_caconnector_object(ca.name)
+                    caconnectors.append(
+                        {
+                            "connectorname": ca.name,
+                            "type": ca.catype,
+                            "data": ca_obj.config,
+                            "templates": ca_obj.get_templates(),
+                        }
+                    )
+                except Exception as exx:  # pragma: no cover
+                    log.debug(traceback.format_exc())
+                    log.error(exx)
+            span.set_attribute("edumfa.caconnector_count", len(caconnectors))
+
+        # Finally, set the current timestamp
+        timestamp = datetime.datetime.now()
+        with self._config_lock:
+            self.config = config
+            self.resolver = resolverconfig
+            self.realm = realmconfig
+            self.default_realm = default_realm
+            self.policies = policies
+            self.events = events
+            self.timestamp = timestamp
+            self.caconnectors = caconnectors
 
     def _clone(self):
         """
@@ -223,8 +241,9 @@ class SharedConfigClass:
         EDUMFA_CHECK_RELOAD_CONFIG setting), reload it if needed and return a
         ``LocalConfigClass`` object containing the current configuration state
         """
-        self._reload_from_db()
-        return self._clone()
+        with trace_span("config.reload_and_clone"):
+            self._reload_from_db()
+            return self._clone()
 
 
 class LocalConfigClass:

@@ -27,6 +27,7 @@ from edumfa.lib.crypto import hash_with_pepper, verify_with_pepper
 from edumfa.lib.policy import LOGINMODE
 from edumfa.lib.policydecorators import libpolicy, login_mode
 from edumfa.lib.token import check_user_pass
+from edumfa.lib.tracing import trace_span
 from edumfa.lib.utils import fetch_one_resource
 from edumfa.models import Admin
 
@@ -49,9 +50,12 @@ def verify_db_admin(username, password) -> bool:
     :rtype: bool
     """
     success = False
-    qa = Admin.query.filter(Admin.username == username).first()
+    with trace_span("auth.verify_db_admin.query") as span:
+        qa = Admin.query.filter(Admin.username == username).first()
+        span.set_attribute("edumfa.admin_found", qa is not None)
     if qa:
-        success = verify_with_pepper(qa.password, password)
+        with trace_span("auth.verify_db_admin.verify_pepper"):
+            success = verify_with_pepper(qa.password, password)
 
     return success
 
@@ -120,7 +124,8 @@ def check_webui_user(
     if check_otp:
         # check if the given password matches an OTP token
         try:
-            check, details = check_user_pass(user_obj, password, options=options)
+            with trace_span("auth.check_webui_user.check_user_pass"):
+                check, details = check_user_pass(user_obj, password, options=options)
             details["loginmode"] = LOGINMODE.EDUMFA
             if check:
                 user_auth = True
@@ -128,8 +133,11 @@ def check_webui_user(
             log.debug(f"Error authenticating user against eduMFA: {e!r}")
     else:
         # check the password of the user against the userstore
-        if user_obj.check_password(password):
-            user_auth = True
+        with trace_span("auth.check_webui_user.check_password") as span:
+            span.set_attribute("edumfa.realm", user_obj.realm)
+            span.set_attribute("edumfa.resolver", user_obj.resolver)
+            if user_obj.check_password(password):
+                user_auth = True
 
     # If the realm is in the SUPERUSER_REALM then the authorization role
     # is risen to "admin".

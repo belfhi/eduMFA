@@ -24,6 +24,19 @@ COPY --from=builder /tmp/dist/*.whl /dist/
 RUN pip install --no-cache-dir /dist/*.whl &&  \
     rm -rf /dist/*.whl
 
+# install opentelemetry dependencies
+RUN pip install \
+  opentelemetry-api \
+  opentelemetry-sdk \
+  opentelemetry-instrumentation \
+  opentelemetry-instrumentation-flask \
+  opentelemetry-instrumentation-wsgi \
+  opentelemetry-instrumentation-sqlalchemy \
+  opentelemetry-instrumentation-psycopg2 \
+  opentelemetry-instrumentation-requests \
+  opentelemetry-instrumentation-urllib3 \
+  opentelemetry-exporter-otlp
+
 # Volume for audit- and enckey
 VOLUME ["/etc/edumfa"]
 
