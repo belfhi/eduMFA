@@ -43,6 +43,7 @@ import traceback
 from dateutil.tz import tzlocal
 from sqlalchemy import and_, func, join
 from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import selectinload
 from sqlalchemy.sql.expression import FunctionElement
 
 from edumfa.lib import _
@@ -81,6 +82,7 @@ from edumfa.lib.policydecorators import (
 from edumfa.lib.realm import realm_is_defined
 from edumfa.lib.resolver import get_resolver_object
 from edumfa.lib.tokenclass import DATE_FORMAT, TOKENKIND, TokenClass
+from edumfa.lib.tracing import trace_span
 from edumfa.lib.user import User
 from edumfa.lib.utils import BASE58, check_serial_valid, hexlify_and_unicode, is_true
 from edumfa.models import (
@@ -360,6 +362,26 @@ def _create_token_query(
     return sql_query
 
 
+def _eager_load_token_relations(sql_query):
+    """
+    Add eager-loading options for the relationships that are accessed when a
+    token is serialized for the token list (``Token.get_vars``).
+
+    Without this, serializing each token issues separate queries for its
+    owner, tokeninfo, realms and tokengroups (the classic N+1 problem), which
+    makes the token list endpoint slow for pages with many tokens.
+
+    :param sql_query: an SQLAlchemy query for ``Token`` objects
+    :return: the query with eager-loading options applied
+    """
+    return sql_query.options(
+        selectinload(Token.info_list),
+        selectinload(Token.realm_list).joinedload(TokenRealm.realm),
+        selectinload(Token.tokengroup_list).joinedload(TokenTokengroup.tokengroup),
+        selectinload(Token.owners_list).joinedload(TokenOwner.realm),
+    )
+
+
 def get_tokens_paginated_generator(
     tokentype=None,
     realm=None,
@@ -519,6 +541,7 @@ def get_tokens(
         ret = sql_query.count()
     else:
         # Return a simple, flat list of tokenobjects
+        sql_query = _eager_load_token_relations(sql_query)
         for token in sql_query.all():
             # the token is the database object, but we want an instance of the
             # tokenclass!
@@ -621,6 +644,7 @@ def get_tokens_paginate(
     else:
         sql_query = sql_query.order_by(sortby.asc())
 
+    sql_query = _eager_load_token_relations(sql_query)
     pagination = sql_query.paginate(page=page, per_page=psize, error_out=False)
     tokens = pagination.items
     prev = None
@@ -630,39 +654,41 @@ def get_tokens_paginate(
     if pagination.has_next:
         next = page + 1
     token_list = []
-    for token in tokens:
-        tokenobject = create_tokenclass_object(token)
-        if isinstance(tokenobject, TokenClass):
-            token_dict = tokenobject.get_as_dict()
-            token_dict["user_realm"] = ""
-            if resolve_users:
-                # add user information
-                # In certain cases the LDAP or SQL server might not be reachable.
-                # Then an exception is raised
-                token_dict["username"] = ""
-                try:
-                    userobject = tokenobject.user
-                    if userobject:
-                        token_dict["username"] = userobject.login
-                        token_dict["user_realm"] = userobject.realm
-                        token_dict["user_editable"] = get_resolver_object(
-                            userobject.resolver
-                        ).editable
-                except Exception as exx:
-                    log.error(f"User information can not be retrieved: {exx}")
-                    log.debug(traceback.format_exc())
-                    token_dict["username"] = "**resolver error**"
-            else:
-                tokenowner = tokenobject.token.first_owner
-                if tokenowner:
-                    token_dict["user_realm"] = tokenowner.realm.name
+    with trace_span("token.get_tokens_paginate.serialize") as span:
+        span.set_attribute("edumfa.token_count", len(tokens))
+        for token in tokens:
+            tokenobject = create_tokenclass_object(token)
+            if isinstance(tokenobject, TokenClass):
+                token_dict = tokenobject.get_as_dict()
+                token_dict["user_realm"] = ""
+                if resolve_users:
+                    # add user information
+                    # In certain cases the LDAP or SQL server might not be reachable.
+                    # Then an exception is raised
+                    token_dict["username"] = ""
+                    try:
+                        userobject = tokenobject.user
+                        if userobject:
+                            token_dict["username"] = userobject.login
+                            token_dict["user_realm"] = userobject.realm
+                            token_dict["user_editable"] = get_resolver_object(
+                                userobject.resolver
+                            ).editable
+                    except Exception as exx:
+                        log.error(f"User information can not be retrieved: {exx}")
+                        log.debug(traceback.format_exc())
+                        token_dict["username"] = "**resolver error**"
+                else:
+                    tokenowner = tokenobject.token.first_owner
+                    if tokenowner:
+                        token_dict["user_realm"] = tokenowner.realm.name
 
-            if hidden_tokeninfo:
-                for key in list(token_dict["info"]):
-                    if key in hidden_tokeninfo:
-                        token_dict["info"].pop(key)
+                if hidden_tokeninfo:
+                    for key in list(token_dict["info"]):
+                        if key in hidden_tokeninfo:
+                            token_dict["info"].pop(key)
 
-            token_list.append(token_dict)
+                token_list.append(token_dict)
 
     ret = {
         "tokens": token_list,

@@ -207,6 +207,16 @@ class Token(MethodsMixin, db.Model):
     info_list = db.relationship("TokenInfo", lazy="select", backref="token")
     # This creates an attribute "token" in the TokenOwner object
     owners = db.relationship("TokenOwner", lazy="dynamic", backref="token")
+    # ``owners`` is a dynamic relationship, which always issues a separate
+    # query and can not be eager-loaded. ``owners_list`` provides the same
+    # data as a normal collection so that callers (e.g. the token list) can
+    # avoid N+1 queries via ``selectinload``.
+    owners_list = db.relationship(
+        "TokenOwner",
+        lazy="select",
+        viewonly=True,
+        back_populates="token_list",
+    )
 
     def __init__(
         self,
@@ -255,6 +265,11 @@ class Token(MethodsMixin, db.Model):
 
     @property
     def first_owner(self):
+        # Prefer the eagerly loaded collection if it has been populated (e.g. by
+        # the token list). This avoids a separate query per token.
+        if "owners_list" not in db.inspect(self).unloaded:
+            owners = self.owners_list
+            return owners[0] if owners else None
         return self.owners.first()
 
     @log_with(log)
@@ -1248,6 +1263,13 @@ class TokenOwner(MethodsMixin, db.Model):
     realm_id = db.Column(db.Integer(), db.ForeignKey("realm.id"))
     # This creates an attribute "tokenowners" in the realm objects
     realm = db.relationship("Realm", lazy="joined", backref="tokenowners")
+    # Eager-loadable counterpart of ``Token.owners_list`` (see there).
+    token_list = db.relationship(
+        "Token",
+        lazy="select",
+        viewonly=True,
+        back_populates="owners_list",
+    )
 
     def __init__(
         self,

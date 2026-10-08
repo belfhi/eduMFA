@@ -52,6 +52,7 @@ from passlib.hash import ldap_salted_sha1
 from edumfa.lib import _
 from edumfa.lib.error import eduMFAError
 from edumfa.lib.framework import get_app_config_value, get_app_local_store
+from edumfa.lib.tracing import trace_span
 from edumfa.lib.utils import convert_column_to_unicode, is_true, to_bytes, to_unicode
 
 from .UserIdResolver import UserIdResolver
@@ -361,22 +362,25 @@ class IdResolver(UserIdResolver):
             # since we must avoid anonymous binds!
             if not bind_user or len(bind_user) < 1:
                 raise Exception("No valid user. Empty bind_user.")
-            l = self.create_connection(
-                authtype=self.authtype,
-                server=self.serverpool,
-                user=bind_user,
-                password=password,
-                receive_timeout=self.timeout,
-                auto_referrals=not self.noreferrals,
-                start_tls=self.start_tls,
-            )
-            r = l.bind()
-            log.debug(f"bind result: {r!r}")
-            if not r:
-                raise Exception("Wrong credentials")
-            log.debug("bind seems successful.")
-            l.unbind()
-            log.debug("unbind successful.")
+            with trace_span("ldap.checkPass.user_bind") as span:
+                span.set_attribute("edumfa.ldap.uri", self.uri)
+                span.set_attribute("edumfa.ldap.authtype", str(self.authtype))
+                l = self.create_connection(
+                    authtype=self.authtype,
+                    server=self.serverpool,
+                    user=bind_user,
+                    password=password,
+                    receive_timeout=self.timeout,
+                    auto_referrals=not self.noreferrals,
+                    start_tls=self.start_tls,
+                )
+                r = l.bind()
+                log.debug(f"bind result: {r!r}")
+                if not r:
+                    raise Exception("Wrong credentials")
+                log.debug("bind seems successful.")
+                l.unbind()
+                log.debug("unbind successful.")
         except Exception as e:
             log.warning(f"failed to check password for {uid!r}/{bind_user!r}: {e!r}")
             log.debug(traceback.format_exc())
@@ -492,12 +496,15 @@ class IdResolver(UserIdResolver):
             self._bind()
             search_userId = self._trim_user_id(userId)
             filter = f"(&{self.searchfilter}({self.uidtype}={search_userId}))"
-            self.l.search(
-                search_base=self.basedn,
-                search_scope=self.scope,
-                search_filter=filter,
-                attributes=list(self.userinfo.values()),
-            )
+            with trace_span("ldap.getDN.search") as span:
+                span.set_attribute("edumfa.ldap.uri", self.uri)
+                span.set_attribute("edumfa.ldap.search_filter", filter)
+                self.l.search(
+                    search_base=self.basedn,
+                    search_scope=self.scope,
+                    search_filter=filter,
+                    attributes=list(self.userinfo.values()),
+                )
             r = self.l.response
             r = self._trim_result(r)
             if len(r) > 1:  # pragma: no cover
@@ -511,21 +518,28 @@ class IdResolver(UserIdResolver):
 
     def _bind(self):
         if not self.i_am_bound:
-            if not self.serverpool:
-                self.serverpool = self.get_serverpool_instance(self.get_info)
-            self.l = self.create_connection(
-                authtype=self.authtype,
-                server=self.serverpool,
-                user=self.binddn,
-                password=self.bindpw,
-                receive_timeout=self.timeout,
-                auto_referrals=not self.noreferrals,
-                start_tls=self.start_tls,
-                keytabfile=self.keytabfile,
-            )
-            if not self.l.bind():
-                raise Exception("Wrong credentials")
-            self.i_am_bound = True
+            with trace_span("ldap.bind") as span:
+                span.set_attribute("edumfa.ldap.uri", self.uri)
+                span.set_attribute("edumfa.ldap.binddn", self.binddn)
+                with trace_span("ldap.bind.get_serverpool"):
+                    if not self.serverpool:
+                        self.serverpool = self.get_serverpool_instance(self.get_info)
+                with trace_span("ldap.bind.create_connection"):
+                    self.l = self.create_connection(
+                        authtype=self.authtype,
+                        server=self.serverpool,
+                        user=self.binddn,
+                        password=self.bindpw,
+                        receive_timeout=self.timeout,
+                        auto_referrals=not self.noreferrals,
+                        start_tls=self.start_tls,
+                        keytabfile=self.keytabfile,
+                    )
+                with trace_span("ldap.bind.bind") as bind_span:
+                    bind_span.set_attribute("edumfa.ldap.timeout", self.timeout)
+                    if not self.l.bind():
+                        raise Exception("Wrong credentials")
+                self.i_am_bound = True
 
     @staticmethod
     def _get_tls_context(
@@ -586,23 +600,26 @@ class IdResolver(UserIdResolver):
         ret = {}
         self._bind()
 
-        if self.uidtype.lower() == "dn":
-            # encode utf8, so that also german umlauts work in the DN
-            self.l.search(
-                search_base=userId,
-                search_scope=self.scope,
-                search_filter="(&" + self.searchfilter + ")",
-                attributes=list(self.userinfo.values()),
-            )
-        else:
-            search_userId = to_unicode(self._trim_user_id(userId))
-            filter = f"(&{self.searchfilter}({self.uidtype}={search_userId}))"
-            self.l.search(
-                search_base=self.basedn,
-                search_scope=self.scope,
-                search_filter=filter,
-                attributes=list(self.userinfo.values()),
-            )
+        with trace_span("ldap.getUserInfo.search") as span:
+            span.set_attribute("edumfa.ldap.uri", self.uri)
+            if self.uidtype.lower() == "dn":
+                # encode utf8, so that also german umlauts work in the DN
+                self.l.search(
+                    search_base=userId,
+                    search_scope=self.scope,
+                    search_filter="(&" + self.searchfilter + ")",
+                    attributes=list(self.userinfo.values()),
+                )
+            else:
+                search_userId = to_unicode(self._trim_user_id(userId))
+                filter = f"(&{self.searchfilter}({self.uidtype}={search_userId}))"
+                span.set_attribute("edumfa.ldap.search_filter", filter)
+                self.l.search(
+                    search_base=self.basedn,
+                    search_scope=self.scope,
+                    search_filter=filter,
+                    attributes=list(self.userinfo.values()),
+                )
 
         r = self.l.response
         r = self._trim_result(r)
@@ -709,12 +726,16 @@ class IdResolver(UserIdResolver):
             attributes.append(str(self.uidtype))
 
         log.debug(f"Searching user {LoginName!r} in LDAP.")
-        self.l.search(
-            search_base=self.basedn,
-            search_scope=self.scope,
-            search_filter=filter,
-            attributes=attributes,
-        )
+        with trace_span("ldap.getUserId.search") as span:
+            span.set_attribute("edumfa.ldap.uri", self.uri)
+            span.set_attribute("edumfa.login", LoginName)
+            span.set_attribute("edumfa.ldap.search_filter", filter)
+            self.l.search(
+                search_base=self.basedn,
+                search_scope=self.scope,
+                search_filter=filter,
+                attributes=attributes,
+            )
 
         r = self.l.response
         r = self._trim_result(r)
