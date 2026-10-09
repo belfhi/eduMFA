@@ -1166,6 +1166,8 @@ myApp.controller("LdapResolverController", [
       SERVERPOOL_ROUNDS: 2,
       SERVERPOOL_STRATEGY: "ROUND_ROBIN",
       SERVERPOOL_SKIP: 30,
+      CONNECTION_IDLE_TIMEOUT: 30,
+      TCP_KEEPALIVE: false,
     };
     $scope.result = {};
     $scope.resolvername = $stateParams.resolvername;
@@ -1195,6 +1197,7 @@ myApp.controller("LdapResolverController", [
         $scope.params.SERVERPOOL_PERSISTENT = isTrue(
           $scope.params.SERVERPOOL_PERSISTENT,
         );
+        $scope.params.TCP_KEEPALIVE = isTrue($scope.params.TCP_KEEPALIVE);
         $scope.params.type = "ldapresolver";
       });
     }

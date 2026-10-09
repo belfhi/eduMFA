@@ -343,6 +343,88 @@
       </div>
     </div>
     <div class="form-group">
+      <label
+        for="connection-idle-timeout"
+        class="col-sm-3 control-label"
+        translate
+      >
+        Connection idle timeout (seconds)
+      </label>
+      <div class="col-sm-3">
+        <input
+          name="connection-idle-timeout"
+          class="form-control"
+          ng-model="params.CONNECTION_IDLE_TIMEOUT"
+          placeholder="30"
+        />
+      </div>
+      <div class="col-sm-6">
+        <p class="help-block" translate>
+          Re-establish the connection to the LDAP server proactively after it
+          has been idle for this many seconds. This avoids delays when the
+          server or a firewall closes idle connections. Set to 0 to disable.
+        </p>
+      </div>
+    </div>
+    <div class="form-group">
+      <label for="tcp-keepalive" class="col-sm-3 control-label" translate>
+        TCP keepalive
+      </label>
+      <div class="col-sm-9">
+        <input
+          name="tcp-keepalive"
+          ng-model="params.TCP_KEEPALIVE"
+          type="checkbox"
+        />
+        <p class="help-block" translate>
+          Enable TCP keepalive on the LDAP connection so that the operating
+          system keeps it alive through a firewall that would otherwise drop it
+          while idle.
+        </p>
+      </div>
+    </div>
+    <div class="form-group" ng-if="params.TCP_KEEPALIVE">
+      <label for="tcp-keepalive-idle" class="col-sm-3 control-label" translate>
+        TCP keepalive idle (seconds)
+      </label>
+      <div class="col-sm-3">
+        <input
+          name="tcp-keepalive-idle"
+          class="form-control"
+          ng-model="params.TCP_KEEPALIVE_IDLE"
+          placeholder="60"
+        />
+      </div>
+      <label
+        for="tcp-keepalive-interval"
+        class="col-sm-3 control-label"
+        translate
+      >
+        TCP keepalive interval (seconds)
+      </label>
+      <div class="col-sm-3">
+        <input
+          name="tcp-keepalive-interval"
+          class="form-control"
+          ng-model="params.TCP_KEEPALIVE_INTERVAL"
+          placeholder="30"
+        />
+      </div>
+    </div>
+    <div class="form-group" ng-if="params.TCP_KEEPALIVE">
+      <label for="tcp-keepalive-count" class="col-sm-3 control-label" translate>
+        TCP keepalive probe count
+      </label>
+      <div class="col-sm-3">
+        <input
+          name="tcp-keepalive-count"
+          class="form-control"
+          ng-model="params.TCP_KEEPALIVE_COUNT"
+          placeholder="3"
+        />
+      </div>
+    </div>
+    <div class="form-group">
       <label for="editable" class="col-sm-3 control-label" translate>
         Edit user store
       </label>

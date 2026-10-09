@@ -162,6 +162,22 @@ has not passed yet. If the *Per-process server pool* is enabled, knowledge about
 servers is persisted within each process. This setting may improve performance in situations in
 which a LDAP server from the pool is down for extended periods of time.
 
+eduMFA reuses one bound connection for querying the LDAP server per resolver and process. If
+the LDAP server (or a firewall/load balancer in between) closes idle connections, the next
+request could otherwise block until the *timeout* is reached before reconnecting. To avoid this,
+``CONNECTION_IDLE_TIMEOUT`` (in seconds, default 30) causes the connection to be re-established
+proactively after it has been idle for that long. Set it to ``0`` to disable proactive
+reconnects.
+
+Alternatively (or additionally) TCP keepalive can be enabled with ``TCP_KEEPALIVE = True``. This
+makes the operating system send small probe packets on the idle connection, which keeps it from
+being considered idle by a firewall. The probe timing can be tuned with ``TCP_KEEPALIVE_IDLE``
+(seconds before the first probe), ``TCP_KEEPALIVE_INTERVAL`` (seconds between probes) and
+``TCP_KEEPALIVE_COUNT`` (failed probes before the connection is considered dead). The defaults
+of the operating system are usually far too slow to help against a firewall; a common setting is
+``TCP_KEEPALIVE_IDLE = 60`` and ``TCP_KEEPALIVE_INTERVAL = 30``. Make sure the idle time is
+shorter than the idle timeout of the firewall in between.
+
 Modifying users
 """""""""""""""
 

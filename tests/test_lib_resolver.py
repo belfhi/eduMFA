@@ -12,6 +12,7 @@ PWFILE = "tests/testdata/passwords"
 import datetime
 import json
 import ssl
+import time
 import uuid
 from unittest import mock
 
@@ -2624,6 +2625,121 @@ class LDAPResolverTestCase(MyTestCase):
         rid2 = y.getResolverId()
         self.assertEqual("ldap.2410a3ae3d7b0957440f3d4994ef569b9bf37d2c", rid2)
         self.assertNotEqual(rid1, rid2)
+
+
+class LDAPConnectionHealthTestCase(MyTestCase):
+    """
+    Test the connection-health handling of the LDAP resolver.
+
+    The LDAP resolver keeps one bound connection per process to avoid a bind
+    per request. Such a connection can be dropped by the server or a firewall
+    while idle. These tests make sure that a stale connection is detected and
+    that ``_bind`` re-establishes the connection instead of silently blocking
+    on the dead socket until ``receive_timeout`` (the cause of slow /auth).
+    """
+
+    class _FakeConnection:
+        def __init__(self, closed=False, bound=True, socket=object()):
+            self.closed = closed
+            self.bound = bound
+            self.socket = socket
+            self.unbound = False
+
+        def unbind(self):
+            self.unbound = True
+
+    def _make_resolver(self, **kwargs):
+        resolver = LDAPResolver()
+        resolver.uri = "ldaps://ldap.example.com"
+        resolver.connection_idle_timeout = 30
+        resolver.get_info = ldap3.NONE
+        resolver.serverpool = mock.MagicMock()
+        resolver.authtype = "Simple"
+        resolver.binddn = "cn=manager,o=test"
+        resolver.bindpw = "secret"
+        resolver.timeout = 5
+        resolver.noreferrals = False
+        resolver.start_tls = False
+        resolver.keytabfile = None
+        resolver.tcp_keepalive = False
+        for key, value in kwargs.items():
+            setattr(resolver, key, value)
+        return resolver
+
+    def test_01_alive_connection_reused(self):
+        resolver = self._make_resolver()
+        resolver.l = self._FakeConnection()
+        resolver._last_used = time.monotonic()
+        self.assertTrue(resolver._connection_is_alive())
+
+    def test_02_idle_connection_considered_dead(self):
+        resolver = self._make_resolver()
+        resolver.l = self._FakeConnection()
+        resolver._last_used = time.monotonic() - 31
+        self.assertFalse(resolver._connection_is_alive())
+
+    def test_03_idle_timeout_can_be_disabled(self):
+        resolver = self._make_resolver(connection_idle_timeout=0)
+        resolver.l = self._FakeConnection()
+        resolver._last_used = time.monotonic() - 10000
+        self.assertTrue(resolver._connection_is_alive())
+
+    def test_04_reasons_for_dead_connection(self):
+        resolver = self._make_resolver()
+        resolver._last_used = time.monotonic()
+
+        resolver.l = self._FakeConnection(closed=True)
+        self.assertFalse(resolver._connection_is_alive())
+
+        resolver.l = self._FakeConnection(bound=False)
+        self.assertFalse(resolver._connection_is_alive())
+
+        resolver.l = self._FakeConnection(socket=None)
+        self.assertFalse(resolver._connection_is_alive())
+
+        resolver.l = None
+        self.assertFalse(resolver._connection_is_alive())
+
+    def test_05_bind_reconnects_dead_connection(self):
+        resolver = self._make_resolver()
+        dead = self._FakeConnection(closed=True)
+        resolver.l = dead
+        resolver.i_am_bound = True
+        resolver._last_used = time.monotonic()
+
+        created = {}
+
+        class _GoodConnection(self._FakeConnection):
+            def bind(self):
+                return True
+
+        def _create_connection(**kwargs):
+            created["connection"] = _GoodConnection()
+            return created["connection"]
+
+        resolver.create_connection = _create_connection
+        resolver._bind()
+
+        # The stale connection must have been dropped and a new one bound.
+        self.assertTrue(dead.unbound)
+        self.assertIs(resolver.l, created["connection"])
+        self.assertTrue(resolver.i_am_bound)
+
+    def test_06_bind_reuses_live_connection(self):
+        resolver = self._make_resolver()
+        live = self._FakeConnection()
+        resolver.l = live
+        resolver.i_am_bound = True
+        resolver._last_used = time.monotonic()
+
+        def _create_connection(**kwargs):  # pragma: no cover
+            raise AssertionError("A live connection must not be re-created")
+
+        resolver.create_connection = _create_connection
+        resolver._bind()
+
+        self.assertIs(resolver.l, live)
+        self.assertFalse(live.unbound)
 
 
 class BaseResolverTestCase(MyTestCase):

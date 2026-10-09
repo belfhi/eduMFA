@@ -35,8 +35,10 @@ import functools
 import hashlib
 import logging
 import os.path
+import socket
 import ssl
 import threading
+import time
 import traceback
 import uuid
 from operator import itemgetter
@@ -58,6 +60,10 @@ from edumfa.lib.utils import convert_column_to_unicode, is_true, to_bytes, to_un
 from .UserIdResolver import UserIdResolver
 
 log = logging.getLogger(__name__)
+
+# Sentinel used to distinguish "the object has no socket attribute" from
+# "the socket attribute is explicitly None".
+_UNKNOWN = object()
 
 try:
     import gssapi
@@ -81,6 +87,11 @@ LDAP_STRATEGY = {
     "RANDOM": ldap3.RANDOM,
 }
 SERVERPOOL_STRATEGY = "ROUND_ROBIN"
+# The number of seconds a service-account connection may be reused while idle.
+# After this period the connection is re-established proactively to avoid
+# blocking on a connection that the LDAP server has silently closed. Set to 0
+# to disable proactive reconnects.
+SERVERPOOL_IDLE_TIMEOUT = 30
 
 # 1 sec == 10^9 nano secs == 10^7 * (100 nano secs)
 MS_AD_MULTIPLYER = 10**7
@@ -280,6 +291,12 @@ class IdResolver(UserIdResolver):
     def __init__(self):
         self.i_am_bound = False
         self.l = None
+        self._last_used = None
+        self.connection_idle_timeout = SERVERPOOL_IDLE_TIMEOUT
+        self.tcp_keepalive = False
+        self.tcp_keepalive_idle = None
+        self.tcp_keepalive_interval = None
+        self.tcp_keepalive_count = None
         self.uri = ""
         self.basedn = ""
         self.binddn = ""
@@ -523,16 +540,19 @@ class IdResolver(UserIdResolver):
         usable.
 
         A connection can go stale between requests because the LDAP server, a
-        firewall or a load balancer closes idle TCP connections. With ldap3's
-        ``RESTARTABLE`` strategy such a stale connection is silently reopened and
-        re-bound on the next operation, which shows up as an unexpectedly slow
-        search. By checking liveness up front we can reconnect and re-bind
-        explicitly (and visibly) instead.
+        firewall or a load balancer closes idle TCP connections. Because ldap3's
+        ``RESTARTABLE`` strategy silently reconnects, the next operation would
+        otherwise first block on the dead socket until ``receive_timeout``
+        expires (which can easily be several seconds) and only then reconnect.
 
-        The check is intentionally conservative: it only reports a connection as
-        dead if ldap3 positively indicates this. If the state cannot be
-        determined (e.g. for test doubles), the connection is assumed to be
-        alive so that we do not introduce unnecessary reconnects.
+        Detecting a silently dropped idle connection is not reliable in a
+        portable way (in particular over TLS, where a non-blocking peek is not
+        possible). We therefore use two conservative signals:
+
+        * ldap3's own connection state (``closed``/``bound``/``socket``), and
+        * the time since the connection was last used. If it has been idle for
+          longer than ``SERVERPOOL_IDLE_TIMEOUT`` seconds, we proactively
+          reconnect so that we do not run into the server's idle timeout.
 
         :return: True if the connection is (probably) open and bound
         """
@@ -545,9 +565,28 @@ class IdResolver(UserIdResolver):
             bound = getattr(conn, "bound", None)
             if bound is not None and not bool(bound):
                 return False
-            socket = getattr(conn, "socket", "unknown")
-            if socket is None:
+            sock = getattr(conn, "socket", _UNKNOWN)
+            if sock is _UNKNOWN:
+                # The connection object does not expose a socket (e.g. a test
+                # double). Assume it is alive to avoid needless reconnects.
+                return True
+            if sock is None:
                 # ldap3 resets ``socket`` to None when the connection was closed
+                return False
+            # Proactively reconnect after an idle period so that we do not hit
+            # the server's (unknown) idle timeout in the middle of an operation.
+            idle_timeout = self.connection_idle_timeout
+            if (
+                idle_timeout > 0
+                and self._last_used is not None
+                and (time.monotonic() - self._last_used) > idle_timeout
+            ):
+                log.debug(
+                    "LDAP connection to %r has been idle for more than %s seconds, "
+                    "reconnecting",
+                    self.uri,
+                    idle_timeout,
+                )
                 return False
             return True
         except Exception as exx:  # pragma: no cover - defensive
@@ -559,6 +598,7 @@ class IdResolver(UserIdResolver):
         # drop it and perform a full bind (this is traced, so a reconnect is
         # visible in the trace instead of being hidden inside the next search).
         if self.i_am_bound and self._connection_is_alive():
+            self._last_used = time.monotonic()
             return
 
         with trace_span("ldap.bind") as span:
@@ -590,7 +630,64 @@ class IdResolver(UserIdResolver):
                 bind_span.set_attribute("edumfa.ldap.timeout", self.timeout)
                 if not self.l.bind():
                     raise Exception("Wrong credentials")
+            self._configure_tcp_keepalive(self.l)
             self.i_am_bound = True
+            self._last_used = time.monotonic()
+
+    def _configure_tcp_keepalive(self, conn):
+        """
+        Enable TCP keepalive on the socket of ``conn``.
+
+        A firewall or load balancer that sits between eduMFA and the LDAP server
+        may silently drop connections from its state table after an idle period.
+        TCP keepalive probes count as traffic and can prevent this, provided the
+        probe interval is shorter than the idle timeout of the firewall.
+
+        The behavior is controlled by the resolver configuration:
+
+        * ``TCP_KEEPALIVE``: enable TCP keepalive (default: disabled)
+        * ``TCP_KEEPALIVE_IDLE``: seconds of idle time before the first probe
+        * ``TCP_KEEPALIVE_INTERVAL``: seconds between probes
+        * ``TCP_KEEPALIVE_COUNT``: number of failed probes before the connection
+          is considered dead
+
+        The idle/interval/count options are only applied if the platform exposes
+        the corresponding socket options (Linux, macOS). On other platforms only
+        ``SO_KEEPALIVE`` is set.
+        """
+        if not self.tcp_keepalive:
+            return
+        sock = getattr(conn, "socket", None)
+        if sock is None:
+            return
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError as exx:  # pragma: no cover - platform dependent
+            log.warning(f"Could not enable SO_KEEPALIVE for {self.uri!r}: {exx!r}")
+            return
+
+        # Platform specific tuning of the keepalive probes.
+        # For details see tcp(7) on Linux and tcp(4P) on macOS.
+        options = [
+            ("TCP_KEEPIDLE", self.tcp_keepalive_idle),
+            ("TCP_KEEPINTVL", self.tcp_keepalive_interval),
+            ("TCP_KEEPCNT", self.tcp_keepalive_count),
+        ]
+        for name, value in options:
+            if not value:
+                continue
+            option = getattr(socket, name, None)
+            if option is None:
+                # macOS uses the differently named TCP_KEEPALIVE,
+                # other platforms may not support the option at all.
+                if name == "TCP_KEEPIDLE":
+                    option = getattr(socket, "TCP_KEEPALIVE", None)
+                if option is None:
+                    continue
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, option, int(value))
+            except OSError as exx:  # pragma: no cover - platform dependent
+                log.debug(f"Could not set {name} for {self.uri!r}: {exx!r}")
 
     @staticmethod
     def _get_tls_context(
@@ -955,10 +1052,20 @@ class IdResolver(UserIdResolver):
         self.serverpool_strategy = (
             config.get("SERVERPOOL_STRATEGY") or SERVERPOOL_STRATEGY
         )
+        self.connection_idle_timeout = int(
+            config.get("CONNECTION_IDLE_TIMEOUT") or SERVERPOOL_IDLE_TIMEOUT
+        )
+        self.tcp_keepalive = is_true(config.get("TCP_KEEPALIVE", False))
+        self.tcp_keepalive_idle = int(config.get("TCP_KEEPALIVE_IDLE") or 0) or None
+        self.tcp_keepalive_interval = (
+            int(config.get("TCP_KEEPALIVE_INTERVAL") or 0) or None
+        )
+        self.tcp_keepalive_count = int(config.get("TCP_KEEPALIVE_COUNT") or 0) or None
         # The configuration might have changed. We reset the serverpool
         self.serverpool = None
         self.i_am_bound = False
         self.l = None
+        self._last_used = None
 
         return self
 
@@ -1172,6 +1279,11 @@ class IdResolver(UserIdResolver):
             "SERVERPOOL_ROUNDS": "int",
             "SERVERPOOL_SKIP": "int",
             "SERVERPOOL_PERSISTENT": "bool",
+            "CONNECTION_IDLE_TIMEOUT": "int",
+            "TCP_KEEPALIVE": "bool",
+            "TCP_KEEPALIVE_IDLE": "int",
+            "TCP_KEEPALIVE_INTERVAL": "int",
+            "TCP_KEEPALIVE_COUNT": "int",
             "OBJECT_CLASSES": "string",
             "DN_TEMPLATE": "string",
             "MULTIVALUEATTRIBUTES": "string",
