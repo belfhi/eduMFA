@@ -43,6 +43,7 @@ import traceback
 from dateutil.tz import tzlocal
 from sqlalchemy import and_, func, join
 from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import selectinload
 from sqlalchemy.sql.expression import FunctionElement
 
 from edumfa.lib import _
@@ -360,6 +361,26 @@ def _create_token_query(
     return sql_query
 
 
+def _eager_load_token_relations(sql_query):
+    """
+    Add eager-loading options for the relationships that are accessed when a
+    token is serialized for the token list (``Token.get_vars``).
+
+    Without this, serializing each token issues separate queries for its
+    owner, tokeninfo, realms and tokengroups (the classic N+1 problem), which
+    makes the token list endpoint slow for pages with many tokens.
+
+    :param sql_query: an SQLAlchemy query for ``Token`` objects
+    :return: the query with eager-loading options applied
+    """
+    return sql_query.options(
+        selectinload(Token.info_list),
+        selectinload(Token.realm_list).joinedload(TokenRealm.realm),
+        selectinload(Token.tokengroup_list).joinedload(TokenTokengroup.tokengroup),
+        selectinload(Token.owners_list).joinedload(TokenOwner.realm),
+    )
+
+
 def get_tokens_paginated_generator(
     tokentype=None,
     realm=None,
@@ -519,6 +540,7 @@ def get_tokens(
         ret = sql_query.count()
     else:
         # Return a simple, flat list of tokenobjects
+        sql_query = _eager_load_token_relations(sql_query)
         for token in sql_query.all():
             # the token is the database object, but we want an instance of the
             # tokenclass!
@@ -621,6 +643,7 @@ def get_tokens_paginate(
     else:
         sql_query = sql_query.order_by(sortby.asc())
 
+    sql_query = _eager_load_token_relations(sql_query)
     pagination = sql_query.paginate(page=page, per_page=psize, error_out=False)
     tokens = pagination.items
     prev = None
